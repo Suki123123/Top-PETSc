@@ -1,0 +1,55 @@
+# =============================================================================
+# PETSc Runtime Options for Multi-GPU Topology Optimization
+# Usage: mpirun -np 4 ./topopt -options_file options_gpu.txt
+# =============================================================================
+
+# ========================== 硬件映射 (GPU Types) =============================
+# 强制矩阵使用 cuSPARSE 格式，向量使用 CUDA 内存
+# 注意: 使用 DM 类型而不是直接设置 mat/vec 类型，避免警告
+-dm_mat_type aijcusparse
+-dm_vec_type cuda
+
+# ========================== 线性求解器 (KSP) =================================
+-ksp_type cg
+-ksp_rtol 1e-8
+-ksp_atol 1e-12
+-ksp_max_it 10000
+
+# ========================== 预处理器 (PC) ====================================
+# 方案 A: GAMG (代数多重网格) - 推荐用于弹性力学问题
+-pc_type gamg
+-pc_gamg_type agg
+-pc_gamg_agg_nsmooths 1
+-pc_gamg_threshold 0.02
+-pc_gamg_reuse_interpolation true
+
+# GAMG 粗网格求解器设置
+-mg_levels_ksp_type chebyshev
+-mg_levels_pc_type jacobi
+-mg_levels_ksp_max_it 2
+-mg_coarse_ksp_type preonly
+-mg_coarse_pc_type redundant
+-mg_coarse_redundant_pc_type lu
+
+# ========================== 方案 B: Jacobi (调试用，取消注释使用) =============
+# -pc_type jacobi
+
+# ========================== 方案 C: ASM (Additive Schwarz) ===================
+# -pc_type asm
+# -pc_asm_overlap 2
+# -sub_pc_type ilu
+# -sub_pc_factor_levels 1
+
+# ========================== 性能监控 =========================================
+-log_view
+-ksp_monitor_short
+-ksp_converged_reason
+
+# GPU 内存池 (减少 cudaMalloc 开销)
+-use_gpu_aware_mpi 0
+
+# ========================== 可选：详细 GPU 性能分析 ==========================
+# 取消注释以获得更详细的 GPU 计时信息
+# -log_view_gpu_time
+# -mat_cusparse_mult_diag_algorithm CUSPARSE_SPMV_CSR_ALG1
+# -mat_cusparse_mult_offdiag_algorithm CUSPARSE_SPMV_CSR_ALG1

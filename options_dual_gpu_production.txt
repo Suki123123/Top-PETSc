@@ -1,0 +1,54 @@
+# =============================================================================
+# 双GPU生产环境配置 - 基于回调函数的几何重离散化GMG
+# 适用于大规模拓扑优化（129³及以上）
+# =============================================================================
+
+# ========================== 硬件映射 ========================================
+-dm_mat_type aijcusparse
+-dm_vec_type cuda
+
+# ========================== 求解器配置 ======================================
+-ksp_type cg
+-ksp_rtol 1e-5
+-ksp_atol 1e-12
+-ksp_max_it 200
+
+# ========================== 预条件器：GMG（几何重离散化）===================
+-pc_type mg
+-pc_mg_type multiplicative
+-pc_mg_cycle_type v
+-pc_mg_galerkin none
+
+# ========================== 细网格光滑器（GPU）==============================
+-mg_levels_ksp_type chebyshev
+-mg_levels_ksp_max_it 2
+-mg_levels_ksp_chebyshev_esteig 0,0.1,0,1.1
+-mg_levels_pc_type jacobi
+
+# ========================== 粗网格求解器（GPU加速）========================
+-mg_coarse_ksp_type cg
+-mg_coarse_ksp_max_it 100
+-mg_coarse_ksp_rtol 1e-8
+-mg_coarse_pc_type jacobi
+-mg_coarse_dm_mat_type aijcusparse
+-mg_coarse_dm_vec_type cuda
+
+# ========================== MPI 设置 ========================================
+-use_gpu_aware_mpi 0
+
+# ========================== 性能监控（生产环境）============================
+-log_view
+-ksp_converged_reason
+
+# =============================================================================
+# 使用方法：
+# mpirun -np 2 ./topopt -options_file options_dual_gpu_production.txt \
+#   -nx 257 -ny 129 -nz 129 -nlvls 4 -filter 2 -rmin 1.5 -volfrac 0.3 -maxiter 100
+# =============================================================================
+
+# 关键特性：
+# 1. 使用PC_MG_GALERKIN_NONE避免GPU显存溢出
+# 2. 通过DMKSPSetComputeOperators回调函数动态组装粗网格算子
+# 3. 所有层级正确应用Dirichlet边界条件
+# 4. GPU加速的粗网格求解器（CG+Jacobi）
+# 5. 移除了所有DEBUG输出以提高性能

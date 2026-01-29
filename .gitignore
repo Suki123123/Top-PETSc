@@ -1,0 +1,24 @@
+# Compiled binary
+TopOpt_in_PETSc/topopt
+
+# Output and restart files
+*.dat
+output_*.dat
+Restart*.dat
+RestartSol*.dat
+
+# Log files
+*.log
+
+# Object files
+*.o
+*.obj
+
+# Editor files
+*~
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
