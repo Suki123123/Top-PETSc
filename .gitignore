@@ -1,8 +1,10 @@
 # Compiled binary
-TopOpt_in_PETSc/topopt
+src/topopt
+*.out
 
 # Output and restart files
 *.dat
+*.dat.info
 output_*.dat
 Restart*.dat
 RestartSol*.dat
@@ -22,3 +24,8 @@ RestartSol*.dat
 # OS files
 .DS_Store
 Thumbs.db
+
+# IDE files
+.vscode/
+.idea/
+*.code-workspace
