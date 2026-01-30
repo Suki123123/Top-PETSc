@@ -6,6 +6,7 @@
 #include <math.h>
 #include <petsc.h>
 #include <petsc/private/dmdaimpl.h>
+#include "MatrixFreeGPU.h"
 
 /*
  Authors: Niels Aage, Erik Andreassen, Boyan Lazarov, August 2013
@@ -18,13 +19,22 @@
  caused by the use of the program.
 */
 
-// 前向声明回调函数
-static PetscErrorCode ComputeMatrix_Level(KSP ksp, Mat J, Mat P, void* ctx);
+// 前向声明
+class LinearElasticity;
+
+// Matrix-Free上下文结构
+typedef struct {
+    LinearElasticity* le;      // LinearElasticity对象指针
+    Vec               xPhys;   // 密度向量
+    PetscScalar       Emin;    // 最小杨氏模量
+    PetscScalar       Emax;    // 最大杨氏模量
+    PetscScalar       penal;   // SIMP惩罚因子
+    DM                da;      // DM对象
+    PetscInt          level;   // 层级索引（-1表示最细层）
+    GPUResources*     gpu_res; // GPU资源
+} MatrixFreeContext;
 
 class LinearElasticity {
-
-    // 声明回调函数为友元
-    friend PetscErrorCode ComputeMatrix_Level(KSP ksp, Mat J, Mat P, void* ctx);
 
   public:
     // Constructor
@@ -60,6 +70,15 @@ class LinearElasticity {
     // Logical mesh
     DM da_nodal; // Nodal mesh
 
+    // Matrix-Free相关（公开以便静态函数访问）
+    PetscBool use_matrix_free;           // 是否使用Matrix-Free
+    PetscScalar KE[24 * 24];             // Element stiffness matrix (moved to public)
+    Vec         N;           // Dirichlet vector (used when imposing BCs)
+    Vec* coarse_N;      // 粗网格Dirichlet向量数组 [nlvls]
+
+    // Routine that doesn't change the element type upon repeated calls (public for MatMult)
+    PetscErrorCode DMDAGetElements_3D(DM dm, PetscInt* nel, PetscInt* nen, const PetscInt* e[]);
+
   private:
     // Logical mesh
     PetscInt    nn[3]; // Number of nodes in each direction
@@ -70,8 +89,6 @@ class LinearElasticity {
     Mat         K;           // Global stiffness matrix
     Vec         U;           // Displacement vector
     Vec         RHS;         // Load vector
-    Vec         N;           // Dirichlet vector (used when imposing BCs)
-    PetscScalar KE[24 * 24]; // Element stiffness matrix
     // Solver
     KSP         ksp; // Pointer to the KSP object i.e. the linear solver+prec
     PetscInt    nlvls;
@@ -80,7 +97,6 @@ class LinearElasticity {
     // 多层网格矩阵（用于几何重离散化GMG）
     Mat* coarse_K;      // 粗网格刚度矩阵数组 [nlvls]
     DM*  coarse_da;     // 粗网格DM数组 [nlvls]
-    Vec* coarse_N;      // 粗网格Dirichlet向量数组 [nlvls]
     Vec* density_levels; // 各层密度向量数组 [nlvls]
     Mat* interpolation; // 插值算子数组 [nlvls-1]
     PetscBool use_geometric_mg;  // 是否使用几何重离散化
@@ -90,37 +106,33 @@ class LinearElasticity {
     PetscScalar current_Emax;
     PetscScalar current_penal;
 
+    // Matrix-Free相关
+    MatrixFreeContext* mf_ctx;           // Matrix-Free上下文（最细层）
+    MatrixFreeContext** mf_ctx_levels;   // 各层的Matrix-Free上下文
+
     // Set up the FE mesh and data structures
     PetscErrorCode SetUpLoadAndBC(DM da_nodes);
 
     // Solve the FE problem
     PetscErrorCode SolveState(Vec xPhys, PetscScalar Emin, PetscScalar Emax, PetscScalar penal);
 
-    // Assemble the stiffness matrix
-    PetscErrorCode AssembleStiffnessMatrix(Vec xPhys, PetscScalar Emin, PetscScalar Emax, PetscScalar penal);
-    
-    // 组装粗网格刚度矩阵（几何重离散化）
-    PetscErrorCode AssembleStiffnessMatrix_Level(PetscInt level, DM da_level, Vec xPhys_level, 
-                                                  Mat K_level, Vec N_level, 
-                                                  PetscScalar Emin, PetscScalar Emax, PetscScalar penal);
-    
     // 密度限制：从细网格限制到所有粗网格
     PetscErrorCode RestrictDensity(Vec xPhys_fine);
-    
+
     // 计算固定自由度（边界条件）
     PetscErrorCode ComputeFixedDOFs_Level(DM dm, IS* fixed_is);
-    
-    // 组装所有层的刚度矩阵
-    PetscErrorCode AssembleAllLevels(Vec xPhys, PetscScalar Emin, PetscScalar Emax, PetscScalar penal);
 
     // Start the solver
     PetscErrorCode SetUpSolver();
-    
+
     // 初始化多层网格（warm-up assembly）
     PetscErrorCode InitializeMultiGrid(Vec xPhys_initial, PetscScalar Emin, PetscScalar Emax, PetscScalar penal);
 
-    // Routine that doesn't change the element type upon repeated calls
-    PetscErrorCode DMDAGetElements_3D(DM dm, PetscInt* nel, PetscInt* nen, const PetscInt* e[]);
+    // Matrix-Free方法
+    PetscErrorCode SetUpMatrixFree();
+    PetscErrorCode CreateShellMatrix(DM da, Vec xPhys, Mat* A,
+                                     PetscScalar Emin, PetscScalar Emax,
+                                     PetscScalar penal, PetscInt level);
 
     // Methods used to assemble the element stiffness matrix
     PetscInt    Hex8Isoparametric(PetscScalar* X, PetscScalar* Y, PetscScalar* Z, PetscScalar nu, PetscInt redInt,

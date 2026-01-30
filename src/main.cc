@@ -1,6 +1,7 @@
 #include "Filter.h"
 #include "LinearElasticity.h"
 #include "MMA.h"
+#include "OC.h"
 #include "MPIIO.h"
 #include "TopOpt.h"
 #include "mpi.h"
@@ -38,10 +39,21 @@ int main(int argc, char* argv[]) {
 
     // STEP 4: VISUALIZATION USING VTK
     MPIIO* output = new MPIIO(opt->da_nodes, 3, "ux, uy, uz", 3, "x, xTilde, xPhys");
-    // STEP 5: THE OPTIMIZER MMA
-    MMA*     mma;
+    // STEP 5: THE OPTIMIZER MMA or OC
+    PetscBool use_oc = PETSC_FALSE;
+    PetscBool flg_oc;
+    PetscOptionsGetBool(NULL, NULL, "-use_oc", &use_oc, &flg_oc);
+
+    MMA*     mma = NULL;
+    OC*      oc = NULL;
     PetscInt itr = 0;
-    opt->AllocateMMAwithRestart(&itr, &mma); // allow for restart !
+
+    if (use_oc) {
+        PetscPrintf(PETSC_COMM_WORLD, "# Using OC (Optimality Criteria) optimizer\n");
+        oc = new OC(opt->n, opt->x);
+    } else {
+        opt->AllocateMMAwithRestart(&itr, &mma); // allow for restart !
+    }
     // mma->SetAsymptotes(0.2, 0.65, 1.05);
 
     // STEP 6: FILTER THE INITIAL DESIGN/RESTARTED DESIGN
@@ -78,15 +90,23 @@ int main(int argc, char* argv[]) {
         CHKERRQ(ierr);
 
         // Sets outer movelimits on design variables
-        ierr = mma->SetOuterMovelimit(opt->Xmin, opt->Xmax, opt->movlim, opt->x, opt->xmin, opt->xmax);
-        CHKERRQ(ierr);
-
-        // Update design by MMA
-        ierr = mma->Update(opt->x, opt->dfdx, opt->gx, opt->dgdx, opt->xmin, opt->xmax);
-        CHKERRQ(ierr);
-
-        // Inf norm on the design change
-        ch = mma->DesignChange(opt->x, opt->xold);
+        if (use_oc) {
+            ierr = oc->SetOuterMovelimit(opt->Xmin, opt->Xmax, opt->movlim, opt->x, opt->xmin, opt->xmax);
+            CHKERRQ(ierr);
+            // Update design by OC
+            ierr = oc->Update(opt->x, opt->dfdx, opt->gx, opt->dgdx, opt->xmin, opt->xmax);
+            CHKERRQ(ierr);
+            // Inf norm on the design change
+            ch = oc->DesignChange(opt->x, opt->xold);
+        } else {
+            ierr = mma->SetOuterMovelimit(opt->Xmin, opt->Xmax, opt->movlim, opt->x, opt->xmin, opt->xmax);
+            CHKERRQ(ierr);
+            // Update design by MMA
+            ierr = mma->Update(opt->x, opt->dfdx, opt->gx, opt->dgdx, opt->xmin, opt->xmax);
+            CHKERRQ(ierr);
+            // Inf norm on the design change
+            ch = mma->DesignChange(opt->x, opt->xold);
+        }
 
         // Increase beta if needed
         PetscBool changeBeta = PETSC_FALSE;
@@ -116,20 +136,23 @@ int main(int argc, char* argv[]) {
         }
 
         // Dump data needed for restarting code at termination
-        if (itr % 10 == 0) {
+        if (itr % 10 == 0 && !use_oc) {
             opt->WriteRestartFiles(&itr, mma);
             physics->WriteRestartFiles();
         }
     }
     // Write restart WriteRestartFiles
-    opt->WriteRestartFiles(&itr, mma);
+    if (!use_oc) {
+        opt->WriteRestartFiles(&itr, mma);
+    }
     physics->WriteRestartFiles();
 
     // Dump final design
     output->WriteVTK(physics->da_nodal, physics->GetStateField(), opt->x, opt->xTilde, opt->xPhys, itr + 1);
 
     // STEP 7: CLEAN UP AFTER YOURSELF
-    delete mma;
+    if (mma) delete mma;
+    if (oc) delete oc;
     delete output;
     delete filter;
     delete opt;

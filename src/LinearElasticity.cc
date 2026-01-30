@@ -1,5 +1,8 @@
 #include "LinearElasticity.h"
+#include "MatrixFreeGPU.h"
 #include <vector>
+#include <petscvec.h>
+#include <cuda_runtime.h>
 
 /*
  Authors: Niels Aage, Erik Andreassen, Boyan Lazarov, August 2013
@@ -11,47 +14,296 @@
 */
 
 // ============================================================================
-// 回调函数上下文结构（用于KSPSetComputeOperators）
+// Matrix-Free矩阵销毁函数
 // ============================================================================
-typedef struct {
-    LinearElasticity* le;      // LinearElasticity对象指针
-    PetscInt          level;   // 当前层级
-} MGLevelContext;
+static PetscErrorCode MatDestroy_MatrixFree(Mat A) {
+    MatrixFreeContext* ctx;
+    MatShellGetContext(A, &ctx);
+    // 释放GPU资源
+    if (ctx->gpu_res) {
+        MatrixFreeGPU_Destroy(ctx->gpu_res);
+    }
+    delete ctx;
+    return 0;
+}
 
 // ============================================================================
-// 回调函数：为指定层组装刚度矩阵
+// Matrix-Free矩阵-向量乘积：y = A*x
+// GPU版本：使用CUDA内核进行计算
 // ============================================================================
-static PetscErrorCode ComputeMatrix_Level(KSP ksp, Mat J, Mat P, void* ctx) {
+static PetscErrorCode MatMult_MatrixFree(Mat A, Vec x, Vec y) {
     PetscErrorCode ierr;
-    MGLevelContext* level_ctx = (MGLevelContext*)ctx;
-    LinearElasticity* le = level_ctx->le;
-    PetscInt level = level_ctx->level;
-    
-    // 获取该层的DM、密度向量和Dirichlet向量
-    DM dm_level;
-    KSPGetDM(ksp, &dm_level);
-    
-    Vec xPhys_level = le->density_levels[level];
-    Vec N_level = (level == le->nlvls - 1) ? le->N : le->coarse_N[level];
-    
-    // 检查密度向量是否有效
-    if (xPhys_level == NULL) {
-        PetscPrintf(PETSC_COMM_WORLD, "ERROR: density_levels[%d] is NULL!\n", level);
-        return PETSC_ERR_ARG_NULL;
+    MatrixFreeContext* ctx;
+
+    // 获取上下文
+    ierr = MatShellGetContext(A, &ctx); CHKERRQ(ierr);
+    LinearElasticity* le = ctx->le;
+
+    // 清零输出向量
+    VecSet(y, 0.0);
+
+    // 获取单元信息
+    PetscInt nel, nen;
+    const PetscInt* necon;
+    ierr = le->DMDAGetElements_3D(ctx->da, &nel, &nen, &necon); CHKERRQ(ierr);
+
+    // 创建局部向量 - 使用与DM关联的向量类型
+    Vec xloc, yloc;
+    DMGetLocalVector(ctx->da, &xloc);
+    DMGetLocalVector(ctx->da, &yloc);
+
+    // 全局到局部（包含halo交换）- PETSc自动处理GPU向量
+    DMGlobalToLocalBegin(ctx->da, x, INSERT_VALUES, xloc);
+    DMGlobalToLocalEnd(ctx->da, x, INSERT_VALUES, xloc);
+    VecSet(yloc, 0.0);
+
+    // 检查是否使用GPU
+    PetscBool use_gpu = PETSC_FALSE;
+    VecType vec_type;
+    VecGetType(xloc, &vec_type);
+    if (vec_type && ctx->gpu_res &&
+        (strcmp(vec_type, VECCUDA) == 0 || strcmp(vec_type, VECMPICUDA) == 0 ||
+         strcmp(vec_type, VECSEQCUDA) == 0)) {
+        use_gpu = PETSC_TRUE;
     }
-    
-    // 组装该层的刚度矩阵
-    ierr = le->AssembleStiffnessMatrix_Level(level, dm_level, xPhys_level, P, N_level,
-                                              le->current_Emin, le->current_Emax, le->current_penal);
-    CHKERRQ(ierr);
-    
-    // 如果J != P，也需要组装J
-    if (J != P) {
-        ierr = le->AssembleStiffnessMatrix_Level(level, dm_level, xPhys_level, J, N_level,
-                                                  le->current_Emin, le->current_Emax, le->current_penal);
-        CHKERRQ(ierr);
+
+    if (use_gpu) {
+        // ========== GPU路径 ==========
+        // 获取GPU指针
+        PetscScalar *d_yloc;
+        const PetscScalar *d_xloc, *d_xPhys;
+
+        ierr = VecCUDAGetArrayRead(xloc, &d_xloc); CHKERRQ(ierr);
+        ierr = VecCUDAGetArray(yloc, &d_yloc); CHKERRQ(ierr);
+        ierr = VecCUDAGetArrayRead(ctx->xPhys, &d_xPhys); CHKERRQ(ierr);
+
+        // 调用GPU内核（只执行单元循环）
+        ierr = MatrixFreeGPU_MatMult(ctx->gpu_res, d_yloc, d_xloc, NULL, d_xPhys, NULL,
+                                     ctx->Emin, ctx->Emax, ctx->penal); CHKERRQ(ierr);
+
+        // 恢复GPU指针
+        ierr = VecCUDARestoreArrayRead(xloc, &d_xloc); CHKERRQ(ierr);
+        ierr = VecCUDARestoreArray(yloc, &d_yloc); CHKERRQ(ierr);
+        ierr = VecCUDARestoreArrayRead(ctx->xPhys, &d_xPhys); CHKERRQ(ierr);
+
+    } else {
+        // ========== CPU路径（回退）==========
+        PetscScalar* xp;
+        VecGetArrayRead(ctx->xPhys, (const PetscScalar**)&xp);
+
+        PetscScalar *xlocal, *ylocal;
+        VecGetArrayRead(xloc, (const PetscScalar**)&xlocal);
+        VecGetArray(yloc, &ylocal);
+
+        // 单元循环
+        PetscInt edof[24];
+        PetscScalar xe[24], ye[24];
+
+        for (PetscInt i = 0; i < nel; i++) {
+            for (PetscInt j = 0; j < nen; j++) {
+                for (PetscInt k = 0; k < 3; k++) {
+                    edof[j * 3 + k] = 3 * necon[i * nen + j] + k;
+                }
+            }
+
+            for (PetscInt j = 0; j < 24; j++) {
+                xe[j] = xlocal[edof[j]];
+            }
+
+            PetscScalar dens = ctx->Emin + PetscPowScalar(xp[i], ctx->penal) * (ctx->Emax - ctx->Emin);
+
+            for (PetscInt j = 0; j < 24; j++) {
+                ye[j] = 0.0;
+                for (PetscInt k = 0; k < 24; k++) {
+                    ye[j] += le->KE[j * 24 + k] * xe[k];
+                }
+                ye[j] *= dens;
+            }
+
+            for (PetscInt j = 0; j < 24; j++) {
+                ylocal[edof[j]] += ye[j];
+            }
+        }
+
+        VecRestoreArrayRead(xloc, (const PetscScalar**)&xlocal);
+        VecRestoreArray(yloc, &ylocal);
+        VecRestoreArrayRead(ctx->xPhys, (const PetscScalar**)&xp);
     }
-    
+
+    // 局部到全局（包含MPI通信）
+    DMLocalToGlobalBegin(ctx->da, yloc, ADD_VALUES, y);
+    DMLocalToGlobalEnd(ctx->da, yloc, ADD_VALUES, y);
+
+    // 应用Dirichlet边界条件
+    Vec N_level = (ctx->level < 0) ? le->N : le->coarse_N[ctx->level];
+
+    if (use_gpu) {
+        // GPU路径：使用GPU内核应用边界条件
+        PetscScalar* d_y;
+        const PetscScalar *d_x, *d_N;
+        PetscInt local_size;
+        VecGetLocalSize(y, &local_size);
+
+        ierr = VecCUDAGetArray(y, &d_y); CHKERRQ(ierr);
+        ierr = VecCUDAGetArrayRead(x, &d_x); CHKERRQ(ierr);
+        ierr = VecCUDAGetArrayRead(N_level, &d_N); CHKERRQ(ierr);
+
+        ierr = MatrixFreeGPU_ApplyBC(ctx->gpu_res, d_y, d_x, d_N, local_size); CHKERRQ(ierr);
+
+        ierr = VecCUDARestoreArray(y, &d_y); CHKERRQ(ierr);
+        ierr = VecCUDARestoreArrayRead(x, &d_x); CHKERRQ(ierr);
+        ierr = VecCUDARestoreArrayRead(N_level, &d_N); CHKERRQ(ierr);
+    } else {
+        // CPU路径
+        PetscScalar* yarr;
+        const PetscScalar* xarr;
+        const PetscScalar* narr;
+        VecGetArray(y, &yarr);
+        VecGetArrayRead(x, &xarr);
+        VecGetArrayRead(N_level, &narr);
+        PetscInt local_size;
+        VecGetLocalSize(y, &local_size);
+        for (PetscInt i = 0; i < local_size; i++) {
+            yarr[i] = narr[i] * yarr[i] + (1.0 - narr[i]) * xarr[i];
+        }
+        VecRestoreArray(y, &yarr);
+        VecRestoreArrayRead(x, &xarr);
+        VecRestoreArrayRead(N_level, &narr);
+    }
+
+    // 归还局部向量
+    DMRestoreLocalVector(ctx->da, &xloc);
+    DMRestoreLocalVector(ctx->da, &yloc);
+    DMDARestoreElements(ctx->da, &nel, &nen, &necon);
+
+    return 0;
+}
+
+// ============================================================================
+// Matrix-Free获取对角线：用于Jacobi预条件器
+// ============================================================================
+static PetscErrorCode MatGetDiagonal_MatrixFree(Mat A, Vec d) {
+    PetscErrorCode ierr;
+    MatrixFreeContext* ctx;
+
+    // 获取上下文
+    ierr = MatShellGetContext(A, &ctx); CHKERRQ(ierr);
+    LinearElasticity* le = ctx->le;
+
+    // 清零对角线向量
+    VecSet(d, 0.0);
+
+    // 获取单元信息
+    PetscInt nel, nen;
+    const PetscInt* necon;
+    ierr = le->DMDAGetElements_3D(ctx->da, &nel, &nen, &necon); CHKERRQ(ierr);
+
+    // 创建局部向量
+    Vec dloc;
+    DMGetLocalVector(ctx->da, &dloc);
+    VecSet(dloc, 0.0);
+
+    // 检查是否使用GPU
+    PetscBool use_gpu = PETSC_FALSE;
+    VecType vec_type;
+    VecGetType(dloc, &vec_type);
+    if (vec_type && ctx->gpu_res &&
+        (strcmp(vec_type, VECCUDA) == 0 || strcmp(vec_type, VECMPICUDA) == 0 ||
+         strcmp(vec_type, VECSEQCUDA) == 0)) {
+        use_gpu = PETSC_TRUE;
+    }
+
+    if (use_gpu) {
+        // ========== GPU路径 ==========
+        PetscScalar *d_dloc;
+        const PetscScalar *d_xPhys;
+
+        ierr = VecCUDAGetArray(dloc, &d_dloc); CHKERRQ(ierr);
+        ierr = VecCUDAGetArrayRead(ctx->xPhys, &d_xPhys); CHKERRQ(ierr);
+
+        // 调用GPU内核
+        ierr = MatrixFreeGPU_GetDiagonal(ctx->gpu_res, d_dloc, d_xPhys, NULL,
+                                          ctx->Emin, ctx->Emax, ctx->penal); CHKERRQ(ierr);
+
+        ierr = VecCUDARestoreArray(dloc, &d_dloc); CHKERRQ(ierr);
+        ierr = VecCUDARestoreArrayRead(ctx->xPhys, &d_xPhys); CHKERRQ(ierr);
+
+    } else {
+        // ========== CPU路径 ==========
+        PetscScalar* xp;
+        VecGetArray(ctx->xPhys, &xp);
+
+        PetscScalar* dlocal;
+        VecGetArray(dloc, &dlocal);
+
+        // 单元循环 - 累加对角线元素
+        PetscInt edof[24];
+
+        for (PetscInt i = 0; i < nel; i++) {
+            // 获取单元DOF
+            for (PetscInt j = 0; j < nen; j++) {
+                for (PetscInt k = 0; k < 3; k++) {
+                    edof[j * 3 + k] = 3 * necon[i * nen + j] + k;
+                }
+            }
+
+            // 计算密度因子
+            PetscScalar dens = ctx->Emin + PetscPowScalar(xp[i], ctx->penal) * (ctx->Emax - ctx->Emin);
+
+            // 累加对角线元素 (KE的对角线元素 * 密度)
+            for (PetscInt j = 0; j < 24; j++) {
+                dlocal[edof[j]] += le->KE[j * 24 + j] * dens;
+            }
+        }
+
+        VecRestoreArray(dloc, &dlocal);
+        VecRestoreArray(ctx->xPhys, &xp);
+    }
+
+    // 局部到全局
+    DMLocalToGlobalBegin(ctx->da, dloc, ADD_VALUES, d);
+    DMLocalToGlobalEnd(ctx->da, dloc, ADD_VALUES, d);
+
+    // 应用Dirichlet边界条件
+    Vec N_level;
+    if (ctx->level < 0) {
+        N_level = le->N;
+    } else {
+        N_level = le->coarse_N[ctx->level];
+    }
+
+    // 对于固定DOF，对角线设为1.0: d = d * N + (1 - N)
+    if (use_gpu) {
+        PetscScalar *d_d;
+        const PetscScalar *d_N;
+        PetscInt local_size;
+        VecGetLocalSize(d, &local_size);
+
+        ierr = VecCUDAGetArray(d, &d_d); CHKERRQ(ierr);
+        ierr = VecCUDAGetArrayRead(N_level, &d_N); CHKERRQ(ierr);
+
+        ierr = MatrixFreeGPU_ApplyBC(ctx->gpu_res, d_d, d_d, d_N, local_size); CHKERRQ(ierr);
+
+        ierr = VecCUDARestoreArray(d, &d_d); CHKERRQ(ierr);
+        ierr = VecCUDARestoreArrayRead(N_level, &d_N); CHKERRQ(ierr);
+    } else {
+        PetscScalar* darr;
+        const PetscScalar* narr;
+        VecGetArray(d, &darr);
+        VecGetArrayRead(N_level, &narr);
+        PetscInt local_size;
+        VecGetLocalSize(d, &local_size);
+        for (PetscInt i = 0; i < local_size; i++) {
+            darr[i] = darr[i] * narr[i] + (1.0 - narr[i]);
+        }
+        VecRestoreArray(d, &darr);
+        VecRestoreArrayRead(N_level, &narr);
+    }
+
+    // 清理
+    DMRestoreLocalVector(ctx->da, &dloc);
+    DMDARestoreElements(ctx->da, &nel, &nen, &necon);
+
     return 0;
 }
 
@@ -63,7 +315,7 @@ LinearElasticity::LinearElasticity(DM da_nodes) {
     N   = NULL;
     ksp = NULL;
     da_nodal;
-    
+
     // 多层网格指针初始化
     coarse_K = NULL;
     coarse_da = NULL;
@@ -72,12 +324,19 @@ LinearElasticity::LinearElasticity(DM da_nodes) {
     interpolation = NULL;
     use_geometric_mg = PETSC_FALSE;
 
+    // Matrix-Free相关初始化 - 默认启用
+    use_matrix_free = PETSC_TRUE;
+    mf_ctx = NULL;
+    mf_ctx_levels = NULL;
+
     // Parameters - to be changed on read of variables
     nu    = 0.3;
     nlvls = 4;
     PetscBool flg;
     PetscOptionsGetInt(NULL, NULL, "-nlvls", &nlvls, &flg);
     PetscOptionsGetReal(NULL, NULL, "-nu", &nu, &flg);
+
+    PetscPrintf(PETSC_COMM_WORLD, "# Matrix-Free mode (default)\n");
 
     // Setup sitffness matrix, load vector and bcs (Dirichlet) for the design
     // problem
@@ -95,7 +354,7 @@ LinearElasticity::~LinearElasticity() {
     if (da_nodal != NULL) {
         DMDestroy(&(da_nodal));
     }
-    
+
     // 释放多层网格资源
     if (coarse_K != NULL) {
         for (PetscInt k = 0; k < nlvls - 1; k++) {
@@ -126,6 +385,12 @@ LinearElasticity::~LinearElasticity() {
             if (interpolation[k] != NULL) MatDestroy(&interpolation[k]);
         }
         delete[] interpolation;
+    }
+
+    // 释放Matrix-Free资源
+    // 注意：mf_ctx和mf_ctx_levels中的上下文会在MatDestroy时自动释放
+    if (mf_ctx_levels != NULL) {
+        delete[] mf_ctx_levels;
     }
 }
 
@@ -232,11 +497,10 @@ PetscErrorCode LinearElasticity::SetUpLoadAndBC(DM da_nodes) {
     PetscScalar epsi = PetscMin(dx * 0.05, PetscMin(dy * 0.05, dz * 0.05));
 
     // Set the values:
-    // In this case: N = the wall at x=xmin is fully clamped
-    //               RHS(z) = sin(pi*y/Ly) at x=xmax,z=zmin;
-    // OR
-    //               RHS(z) = -0.1 at x=xmax,z=zmin;
-    PetscScalar LoadIntensity = -0.001;
+    // Cantilever beam: Left face fixed, load on bottom edge of right face
+    // N = the wall at x=xmin is fully clamped
+    // RHS(z) = -1.0 at x=xmax, z=zmin (bottom edge)
+    PetscScalar LoadIntensity = -1.0;
     for (PetscInt i = 0; i < nn; i++) {
         // Make a wall with all dofs clamped
         if (i % 3 == 0 && PetscAbsScalar(lcoorp[i] - xc[0]) < epsi) {
@@ -275,47 +539,79 @@ PetscErrorCode LinearElasticity::SolveState(Vec xPhys, PetscScalar Emin, PetscSc
     double t1, t2;
     t1 = MPI_Wtime();
 
-    // Assemble the stiffness matrix (最细层)
-    ierr = AssembleStiffnessMatrix(xPhys, Emin, Emax, penal);
-    CHKERRQ(ierr);
+    // Matrix-Free模式：不组装矩阵，只更新上下文
+    // 更新材料参数
+    current_Emin = Emin;
+    current_Emax = Emax;
+    current_penal = penal;
 
-    // Setup the solver
+    // Setup the solver (first time only)
     if (ksp == NULL) {
+        // 设置求解器（会创建Shell矩阵）
         ierr = SetUpSolver();
         CHKERRQ(ierr);
-        
-        // 如果使用几何重离散化，在第一次solve之前初始化密度
+
+        // 初始化密度向量（在SetUpSolver之后，因为use_geometric_mg在SetUpSolver中设置）
         if (use_geometric_mg) {
-            current_Emin = Emin;
-            current_Emax = Emax;
-            current_penal = penal;
-            
-            // 初始化密度向量
             ierr = RestrictDensity(xPhys);
             CHKERRQ(ierr);
+        }
+
+        // 更新Matrix-Free上下文（使用实际的xPhys）
+        MatrixFreeContext* ctx;
+        MatShellGetContext(K, &ctx);
+        ctx->xPhys = xPhys;
+        ctx->Emin = Emin;
+        ctx->Emax = Emax;
+        ctx->penal = penal;
+
+        // 更新粗网格上下文
+        if (use_geometric_mg && mf_ctx_levels != NULL) {
+            for (PetscInt k = 0; k < nlvls - 1; k++) {
+                if (mf_ctx_levels[k] != NULL) {
+                    mf_ctx_levels[k]->xPhys = density_levels[k];
+                    mf_ctx_levels[k]->Emin = Emin;
+                    mf_ctx_levels[k]->Emax = Emax;
+                    mf_ctx_levels[k]->penal = penal;
+                }
+            }
         }
     } else {
-        // 如果使用几何重离散化，更新材料参数和密度
+        // 更新密度限制
         if (use_geometric_mg) {
-            current_Emin = Emin;
-            current_Emax = Emax;
-            current_penal = penal;
-            
-            // 密度限制：从细网格限制到所有粗网格
             ierr = RestrictDensity(xPhys);
             CHKERRQ(ierr);
         }
-        
-        ierr = KSPSetOperators(ksp, K, K);
-        CHKERRQ(ierr);
-        KSPSetUp(ksp);
+
+        // 更新Matrix-Free上下文
+        MatrixFreeContext* ctx;
+        MatShellGetContext(K, &ctx);
+        ctx->xPhys = xPhys;
+        ctx->Emin = Emin;
+        ctx->Emax = Emax;
+        ctx->penal = penal;
+
+        // 更新粗网格上下文
+        if (use_geometric_mg && mf_ctx_levels != NULL) {
+            for (PetscInt k = 0; k < nlvls - 1; k++) {
+                if (mf_ctx_levels[k] != NULL) {
+                    mf_ctx_levels[k]->xPhys = density_levels[k];
+                    mf_ctx_levels[k]->Emin = Emin;
+                    mf_ctx_levels[k]->Emax = Emax;
+                    mf_ctx_levels[k]->penal = penal;
+                }
+            }
+        }
     }
 
-    // Solve (回调函数会自动被调用)
+    // 重新设置算子（触发KSP更新）
+    ierr = KSPSetOperators(ksp, K, K);
+    CHKERRQ(ierr);
+
+    // Solve
     ierr = KSPSolve(ksp, RHS, U);
     CHKERRQ(ierr);
 
-    // DEBUG
     // Get iteration number and residual from KSP
     PetscInt    niter;
     PetscScalar rnorm;
@@ -486,51 +782,123 @@ PetscErrorCode LinearElasticity::ComputeObjectiveConstraintsSensitivities(PetscS
     const PetscInt* necon;
     ierr = DMDAGetElements_3D(da_nodal, &nel, &nen, &necon);
     CHKERRQ(ierr);
-    // DMDAGetElements(da_nodes,&nel,&nen,&necon); // Still issue with elemtype
-    // change !
 
-    // Get pointer to the densities
-    PetscScalar* xp;
-    VecGetArray(xPhys, &xp);
-
-    // Get Solution
+    // Get Solution - create local vector with ghost nodes
     Vec Uloc;
     DMCreateLocalVector(da_nodal, &Uloc);
     DMGlobalToLocalBegin(da_nodal, U, INSERT_VALUES, Uloc);
     DMGlobalToLocalEnd(da_nodal, U, INSERT_VALUES, Uloc);
 
-    // get pointer to local vector
-    PetscScalar* up;
-    VecGetArray(Uloc, &up);
+    // Check if GPU is available
+    PetscBool use_gpu = PETSC_FALSE;
+    VecType vec_type;
+    VecGetType(Uloc, &vec_type);
 
-    // Get dfdx
-    PetscScalar* df;
-    VecGetArray(dfdx, &df);
+    // Also check dfdx and xPhys vector types
+    VecType dfdx_type, xPhys_type;
+    VecGetType(dfdx, &dfdx_type);
+    VecGetType(xPhys, &xPhys_type);
 
-    // Edof array
-    PetscInt edof[24];
+    // 检查是否可以使用GPU
+    // 只有当所有向量都是CUDA向量时才使用GPU
+    PetscBool uloc_cuda = PETSC_FALSE;
+    PetscBool dfdx_cuda = PETSC_FALSE;
+    PetscBool xPhys_cuda = PETSC_FALSE;
+
+    if (vec_type && (strcmp(vec_type, VECCUDA) == 0 || strcmp(vec_type, VECMPICUDA) == 0 || strcmp(vec_type, VECSEQCUDA) == 0)) {
+        uloc_cuda = PETSC_TRUE;
+    }
+    if (dfdx_type && (strcmp(dfdx_type, VECCUDA) == 0 || strcmp(dfdx_type, VECMPICUDA) == 0 || strcmp(dfdx_type, VECSEQCUDA) == 0)) {
+        dfdx_cuda = PETSC_TRUE;
+    }
+    if (xPhys_type && (strcmp(xPhys_type, VECCUDA) == 0 || strcmp(xPhys_type, VECMPICUDA) == 0 || strcmp(xPhys_type, VECSEQCUDA) == 0)) {
+        xPhys_cuda = PETSC_TRUE;
+    }
+
+    if (uloc_cuda && dfdx_cuda && xPhys_cuda && mf_ctx && mf_ctx->gpu_res) {
+        use_gpu = PETSC_TRUE;
+    }
 
     fx[0] = 0.0;
-    // Loop over elements
-    for (PetscInt i = 0; i < nel; i++) {
-        // loop over element nodes
-        for (PetscInt j = 0; j < nen; j++) {
-            // Get local dofs
-            for (PetscInt k = 0; k < 3; k++) {
-                edof[j * 3 + k] = 3 * necon[i * nen + j] + k;
-            }
+
+    if (use_gpu) {
+        // ========== GPU路径 ==========
+        const PetscScalar *d_uloc, *d_xPhys;
+        PetscScalar *d_dfdx;
+
+        // 获取GPU指针
+        ierr = VecCUDAGetArrayRead(Uloc, &d_uloc); CHKERRQ(ierr);
+        ierr = VecCUDAGetArrayRead(xPhys, &d_xPhys); CHKERRQ(ierr);
+        ierr = VecCUDAGetArray(dfdx, &d_dfdx); CHKERRQ(ierr);
+
+        // 分配临时GPU内存用于部分目标函数值
+        PetscScalar* d_fx_partial;
+        cudaMalloc(&d_fx_partial, nel * sizeof(PetscScalar));
+
+        // 调用GPU内核
+        ierr = MatrixFreeGPU_ComputeSensitivity(mf_ctx->gpu_res, d_fx_partial, d_dfdx,
+                                                 d_uloc, d_xPhys, Emin, Emax, penal);
+        CHKERRQ(ierr);
+
+        // 将部分目标函数值复制回CPU并求和
+        PetscScalar* fx_partial = new PetscScalar[nel];
+        cudaMemcpy(fx_partial, d_fx_partial, nel * sizeof(PetscScalar), cudaMemcpyDeviceToHost);
+
+        for (PetscInt i = 0; i < nel; i++) {
+            fx[0] += fx_partial[i];
         }
-        // Use SIMP for stiffness interpolation
-        PetscScalar uKu = 0.0;
-        for (PetscInt k = 0; k < 24; k++) {
-            for (PetscInt h = 0; h < 24; h++) {
-                uKu += up[edof[k]] * KE[k * 24 + h] * up[edof[h]];
+
+        // 清理
+        delete[] fx_partial;
+        cudaFree(d_fx_partial);
+
+        // 恢复GPU指针
+        ierr = VecCUDARestoreArrayRead(Uloc, &d_uloc); CHKERRQ(ierr);
+        ierr = VecCUDARestoreArrayRead(xPhys, &d_xPhys); CHKERRQ(ierr);
+        ierr = VecCUDARestoreArray(dfdx, &d_dfdx); CHKERRQ(ierr);
+
+    } else {
+        // ========== CPU路径（回退）==========
+        // Get pointer to the densities
+        PetscScalar* xp;
+        VecGetArray(xPhys, &xp);
+
+        // get pointer to local vector
+        PetscScalar* up;
+        VecGetArray(Uloc, &up);
+
+        // Get dfdx
+        PetscScalar* df;
+        VecGetArray(dfdx, &df);
+
+        // Edof array
+        PetscInt edof[24];
+
+        // Loop over elements
+        for (PetscInt i = 0; i < nel; i++) {
+            // loop over element nodes
+            for (PetscInt j = 0; j < nen; j++) {
+                // Get local dofs
+                for (PetscInt k = 0; k < 3; k++) {
+                    edof[j * 3 + k] = 3 * necon[i * nen + j] + k;
+                }
             }
+            // Use SIMP for stiffness interpolation
+            PetscScalar uKu = 0.0;
+            for (PetscInt k = 0; k < 24; k++) {
+                for (PetscInt h = 0; h < 24; h++) {
+                    uKu += up[edof[k]] * KE[k * 24 + h] * up[edof[h]];
+                }
+            }
+            // Add to objective
+            fx[0] += (Emin + PetscPowScalar(xp[i], penal) * (Emax - Emin)) * uKu;
+            // Set the Senstivity
+            df[i] = -1.0 * penal * PetscPowScalar(xp[i], penal - 1) * (Emax - Emin) * uKu;
         }
-        // Add to objective
-        fx[0] += (Emin + PetscPowScalar(xp[i], penal) * (Emax - Emin)) * uKu;
-        // Set the Senstivity
-        df[i] = -1.0 * penal * PetscPowScalar(xp[i], penal - 1) * (Emax - Emin) * uKu;
+
+        VecRestoreArray(xPhys, &xp);
+        VecRestoreArray(Uloc, &up);
+        VecRestoreArray(dfdx, &df);
     }
 
     // Allreduce fx[0]
@@ -546,10 +914,8 @@ PetscErrorCode LinearElasticity::ComputeObjectiveConstraintsSensitivities(PetscS
     gx[0] = gx[0] / (((PetscScalar)neltot)) - volfrac;
     VecSet(dgdx, 1.0 / (((PetscScalar)neltot)));
 
-    VecRestoreArray(xPhys, &xp);
-    VecRestoreArray(Uloc, &up);
-    VecRestoreArray(dfdx, &df);
     VecDestroy(&Uloc);
+    DMDARestoreElements(da_nodal, &nel, &nen, &necon);
 
     return (ierr);
 }
@@ -593,70 +959,6 @@ PetscErrorCode LinearElasticity::WriteRestartFiles() {
 // ######################## PRIVATE ################################
 //##################################################################
 //##################################################################
-
-PetscErrorCode LinearElasticity::AssembleStiffnessMatrix(Vec xPhys, PetscScalar Emin, PetscScalar Emax,
-                                                         PetscScalar penal) {
-
-    PetscErrorCode ierr;
-
-    // Get the FE mesh structure (from the nodal mesh)
-    PetscInt        nel, nen;
-    const PetscInt* necon;
-    ierr = DMDAGetElements_3D(da_nodal, &nel, &nen, &necon);
-    CHKERRQ(ierr);
-
-    // Get pointer to the densities
-    PetscScalar* xp;
-    VecGetArray(xPhys, &xp);
-
-    // Zero the matrix
-    MatZeroEntries(K);
-
-    // Edof array
-    PetscInt    edof[24];
-    PetscScalar ke[24 * 24];
-
-    // Loop over elements
-    for (PetscInt i = 0; i < nel; i++) {
-        // loop over element nodes
-        for (PetscInt j = 0; j < nen; j++) {
-            // Get local dofs
-            for (PetscInt k = 0; k < 3; k++) {
-                edof[j * 3 + k] = 3 * necon[i * nen + j] + k;
-            }
-        }
-        // Use SIMP for stiffness interpolation
-        PetscScalar dens = Emin + PetscPowScalar(xp[i], penal) * (Emax - Emin);
-        for (PetscInt k = 0; k < 24 * 24; k++) {
-            ke[k] = KE[k] * dens;
-        }
-        // Add values to the sparse matrix
-        ierr = MatSetValuesLocal(K, 24, edof, 24, edof, ke, ADD_VALUES);
-        CHKERRQ(ierr);
-    }
-    MatAssemblyBegin(K, MAT_FINAL_ASSEMBLY);
-    MatAssemblyEnd(K, MAT_FINAL_ASSEMBLY);
-
-    // Impose the dirichlet conditions, i.e. K = N'*K*N - (N-I)
-    // 1.: K = N'*K*N
-    MatDiagonalScale(K, N, N);
-    // 2. Add ones, i.e. K = K + NI, NI = I - N
-    Vec NI;
-    VecDuplicate(N, &NI);
-    VecSet(NI, 1.0);
-    VecAXPY(NI, -1.0, N);
-    MatDiagonalSet(K, NI, ADD_VALUES);
-
-    // Zero out possible loads in the RHS that coincide
-    // with Dirichlet conditions
-    VecPointwiseMult(RHS, RHS, N);
-
-    VecDestroy(&NI);
-    VecRestoreArray(xPhys, &xp);
-    DMDARestoreElements(da_nodal, &nel, &nen, &necon);
-
-    return ierr;
-}
 
 PetscErrorCode LinearElasticity::SetUpSolver() {
 
@@ -757,6 +1059,24 @@ PetscErrorCode LinearElasticity::SetUpSolver() {
     ierr = KSPSetInitialGuessNonzero(ksp, PETSC_TRUE);
     CHKERRQ(ierr);
 
+    // Matrix-Free模式：创建Shell矩阵
+    PetscPrintf(PETSC_COMM_WORLD, "# Creating Matrix-Free Shell matrix for finest level\n");
+    MatDestroy(&K);
+
+    // 创建临时密度向量用于初始化
+    Vec xPhys_temp;
+    DMCreateGlobalVector(da_nodal, &xPhys_temp);
+    VecSet(xPhys_temp, 0.5);  // 使用默认密度值
+
+    ierr = CreateShellMatrix(da_nodal, xPhys_temp, &K, current_Emin, current_Emax, current_penal, -1);
+    CHKERRQ(ierr);
+
+    // 保存最细层上下文（用于敏感度计算等）
+    MatShellGetContext(K, &mf_ctx);
+
+    // 保存临时密度向量的引用（稍后会被实际的xPhys替换）
+    // 注意：这个向量会在SolveState中被替换
+
     ierr = KSPSetOperators(ksp, K, K);
     CHKERRQ(ierr);
 
@@ -780,7 +1100,6 @@ PetscErrorCode LinearElasticity::SetUpSolver() {
 
         // DMs for grid hierachy
         DM *da_list, *daclist;
-        Mat R;
 
         PetscMalloc(sizeof(DM) * nlvls, &da_list);
         for (PetscInt k = 0; k < nlvls; k++)
@@ -830,66 +1149,93 @@ PetscErrorCode LinearElasticity::SetUpSolver() {
         for (PetscInt k = 0; k < nlvls; k++) {
             density_levels[k] = NULL;
         }
-        
+
         // 设置插值算子并保存粗网格DM
         for (PetscInt k = 1; k < nlvls; k++) {
             Mat R;
             DMCreateInterpolation(da_list[k - 1], da_list[k], &R, NULL);
             PCMGSetInterpolation(pc, k, R);
-            
+
             // 保存插值算子（用于密度限制）
             interpolation[k - 1] = R;
             PetscObjectReference((PetscObject)R);
             MatDestroy(&R);
-            
+
             // 保存粗网格DM（需要增加引用计数）
             coarse_da[k - 1] = da_list[k - 1];
             PetscObjectReference((PetscObject)coarse_da[k - 1]);
-            
-            // 为粗网格创建刚度矩阵
-            DMCreateMatrix(coarse_da[k - 1], &coarse_K[k - 1]);
-            
-            // 为粗网格创建Dirichlet向量
+
+            // 为粗网格创建密度向量（初始化为默认值）
+            DMCreateGlobalVector(coarse_da[k - 1], &density_levels[k - 1]);
+            VecSet(density_levels[k - 1], 0.5);  // 使用默认密度值
+
+            // 为粗网格创建Shell矩阵（使用密度向量）
+            ierr = CreateShellMatrix(coarse_da[k - 1], density_levels[k - 1], &coarse_K[k - 1],
+                                    current_Emin, current_Emax, current_penal, k - 1);
+            CHKERRQ(ierr);
+
+            // 为粗网格创建Dirichlet向量并设置边界条件
             DMCreateGlobalVector(coarse_da[k - 1], &coarse_N[k - 1]);
             VecSet(coarse_N[k - 1], 1.0);
-            
-            // 为粗网格创建密度向量（初始化为0）
-            DMCreateGlobalVector(coarse_da[k - 1], &density_levels[k - 1]);
-            VecSet(density_levels[k - 1], 0.0);
+
+            // 设置粗网格边界条件（与细网格相同的逻辑）
+            {
+                Vec lcoor;
+                PetscScalar* lcoorp;
+                ierr = DMGetCoordinatesLocal(coarse_da[k - 1], &lcoor);
+                CHKERRQ(ierr);
+                VecGetArray(lcoor, &lcoorp);
+
+                PetscInt nn_local;
+                VecGetSize(lcoor, &nn_local);
+
+                PetscScalar epsi = PetscMin(xc[1] - xc[0], PetscMin(xc[3] - xc[2], xc[5] - xc[4])) * 0.05;
+
+                for (PetscInt i = 0; i < nn_local; i++) {
+                    // 在x=xmin处固定所有自由度
+                    if (i % 3 == 0 && PetscAbsScalar(lcoorp[i] - xc[0]) < epsi) {
+                        VecSetValueLocal(coarse_N[k - 1], i, 0.0, INSERT_VALUES);
+                        VecSetValueLocal(coarse_N[k - 1], i + 1, 0.0, INSERT_VALUES);
+                        VecSetValueLocal(coarse_N[k - 1], i + 2, 0.0, INSERT_VALUES);
+                    }
+                }
+
+                VecRestoreArray(lcoor, &lcoorp);
+                VecAssemblyBegin(coarse_N[k - 1]);
+                VecAssemblyEnd(coarse_N[k - 1]);
+            }
         }
-        
+
         // 最细层密度向量将在RestrictDensity中创建
-        
-        // 为粗网格DM注册回调函数
+
+        // 分配上下文数组并保存引用
+        mf_ctx_levels = new MatrixFreeContext*[nlvls - 1];
         for (PetscInt k = 0; k < nlvls - 1; k++) {
-            MGLevelContext* level_ctx = new MGLevelContext;
-            level_ctx->le = this;
-            level_ctx->level = k;
-            
-            ierr = DMKSPSetComputeOperators(coarse_da[k], ComputeMatrix_Level, level_ctx);
-            CHKERRQ(ierr);
+            MatShellGetContext(coarse_K[k], &mf_ctx_levels[k]);
         }
-        
-        // 为每层的KSP设置DM
+        // 保存最细层上下文
+        MatShellGetContext(K, &mf_ctx);
+
+        // 为每层的KSP设置算子
         for (PetscInt k = 0; k < nlvls; k++) {
             KSP level_ksp;
-            DM dm_level;
-            
+
             if (k == 0) {
                 // 最粗层
                 PCMGGetCoarseSolve(pc, &level_ksp);
-                dm_level = coarse_da[0];
             } else if (k < nlvls - 1) {
                 // 中间层
                 PCMGGetSmoother(pc, k, &level_ksp);
-                dm_level = coarse_da[k];
             } else {
                 // 最细层 - 不设置DM，直接使用KSPSetOperators
                 continue;
             }
-            
-            // 将DM与KSP关联
-            ierr = KSPSetDM(level_ksp, dm_level);
+
+            // 直接设置Shell矩阵作为算子
+            ierr = KSPSetOperators(level_ksp, coarse_K[k], coarse_K[k]);
+            CHKERRQ(ierr);
+            // 不设置DM，避免回调函数被调用
+            ierr = KSPSetDMActive(level_ksp, PETSC_FALSE);
             CHKERRQ(ierr);
         }
 
@@ -912,24 +1258,27 @@ PetscErrorCode LinearElasticity::SetUpSolver() {
             // ierr = KSPSetType(cksp,KSPCG);
 
             ierr = KSPSetTolerances(cksp, coarse_rtol, coarse_atol, coarse_dtol, coarse_maxits);
-            // The preconditioner
+            // The preconditioner - 使用None（Matrix-Free兼容）
             PC cpc;
             KSPGetPC(cksp, &cpc);
-            PCSetType(cpc, PCSOR); // PCGAMG, PCSOR, PCSPAI (NEEDS TO BE COMPILED), PCJACOBI
+            PCSetType(cpc, PCNONE);
+
+            // 允许命令行覆盖
+            KSPSetFromOptions(cksp);
 
             // Set smoothers on all levels (except for coarse grid):
+            // 使用Chebyshev + None（不需要矩阵操作）
             for (PetscInt k = 1; k < nlvls; k++) {
                 KSP dksp;
                 PCMGGetSmoother(pc, k, &dksp);
                 PC dpc;
                 KSPGetPC(dksp, &dpc);
-                ierr = KSPSetType(dksp,
-                                  KSPGMRES); // KSPCG, KSPGMRES, KSPCHEBYSHEV (VERY GOOD FOR SPD)
-                ierr = KSPGMRESSetRestart(dksp, smooth_sweeps);
-                // ierr = KSPSetType(dksp,KSPCHEBYSHEV);
+                ierr = KSPSetType(dksp, KSPCHEBYSHEV);
                 ierr = KSPSetTolerances(dksp, PETSC_DEFAULT, PETSC_DEFAULT, PETSC_DEFAULT,
-                                        smooth_sweeps); // NOTE in the above maxitr=restart;
-                PCSetType(dpc, PCSOR);                  // PCJACOBI, PCSOR for KSPCHEBYSHEV very good
+                                        smooth_sweeps);
+                PCSetType(dpc, PCNONE);
+                // 允许命令行覆盖
+                KSPSetFromOptions(dksp);
             }
         }
     }
@@ -1244,87 +1593,141 @@ PetscScalar LinearElasticity::Inverse3M(PetscScalar J[][3], PetscScalar invJ[][3
 }
 
 // 密度限制：从细网格限制到所有粗网格
+// 注意：此函数需要正确处理MPI并行环境
 PetscErrorCode LinearElasticity::RestrictDensity(Vec xPhys_fine) {
     PetscErrorCode ierr = 0;
-    
+    PetscInt rank, size;
+    MPI_Comm_rank(PETSC_COMM_WORLD, &rank);
+    MPI_Comm_size(PETSC_COMM_WORLD, &size);
+
     // 最细层直接使用输入密度
     if (density_levels[nlvls - 1] == NULL) {
         VecDuplicate(xPhys_fine, &density_levels[nlvls - 1]);
     }
     VecCopy(xPhys_fine, density_levels[nlvls - 1]);
-    
+
     // 从细到粗逐层限制
-    // 注意：密度是基于单元的，而插值算子是基于节点的，所以不能直接使用
-    // 我们使用简单的平均方法：每个粗单元的密度 = 对应8个细单元密度的平均
     for (PetscInt level = nlvls - 2; level >= 0; level--) {
         Vec x_fine = density_levels[level + 1];
         Vec x_coarse = density_levels[level];
         DM dm_fine = (level == nlvls - 2) ? da_nodal : coarse_da[level + 1];
         DM dm_coarse = coarse_da[level];
-        
-        // 获取网格尺寸（节点数）
+
+        // 获取网格尺寸（全局节点数）
         PetscInt M_fine, N_fine, P_fine;
         DMDAGetInfo(dm_fine, NULL, &M_fine, &N_fine, &P_fine, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
-        PetscInt ne_fine[3] = {M_fine - 1, N_fine - 1, P_fine - 1};  // 单元数
-        
+        PetscInt ne_fine[3] = {M_fine - 1, N_fine - 1, P_fine - 1};
+
         PetscInt M_coarse, N_coarse, P_coarse;
         DMDAGetInfo(dm_coarse, NULL, &M_coarse, &N_coarse, &P_coarse, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
-        PetscInt ne_coarse[3] = {M_coarse - 1, N_coarse - 1, P_coarse - 1};  // 单元数
-        
-        // 获取密度数组（全局）
-        PetscScalar* xf;
-        PetscScalar* xc;
-        VecGetArray(x_fine, &xf);
-        VecGetArray(x_coarse, &xc);
-        
-        // 获取向量大小
-        PetscInt size_fine, size_coarse;
-        VecGetLocalSize(x_fine, &size_fine);
-        VecGetLocalSize(x_coarse, &size_coarse);
-        
-        // 限制：每个粗单元对应8个细单元（2x2x2）
-        // 粗单元(i,j,k)对应细单元(2i:2i+1, 2j:2j+1, 2k:2k+1)
-        // 注意：这里假设密度向量是按照(i,j,k)顺序存储的
-        for (PetscInt k = 0; k < ne_coarse[2]; k++) {
-            for (PetscInt j = 0; j < ne_coarse[1]; j++) {
-                for (PetscInt i = 0; i < ne_coarse[0]; i++) {
-                    PetscInt idx_coarse = i + j * ne_coarse[0] + k * ne_coarse[0] * ne_coarse[1];
-                    
-                    if (idx_coarse >= size_coarse) {
-                        continue;
-                    }
-                    
-                    // 对应的8个细单元
-                    PetscScalar sum = 0.0;
-                    PetscInt count = 0;
-                    for (PetscInt kk = 0; kk < 2; kk++) {
-                        for (PetscInt jj = 0; jj < 2; jj++) {
-                            for (PetscInt ii = 0; ii < 2; ii++) {
-                                PetscInt i_fine = 2 * i + ii;
-                                PetscInt j_fine = 2 * j + jj;
-                                PetscInt k_fine = 2 * k + kk;
-                                
-                                if (i_fine < ne_fine[0] && j_fine < ne_fine[1] && k_fine < ne_fine[2]) {
-                                    PetscInt idx_fine = i_fine + j_fine * ne_fine[0] + k_fine * ne_fine[0] * ne_fine[1];
-                                    
-                                    if (idx_fine < size_fine) {
+        PetscInt ne_coarse[3] = {M_coarse - 1, N_coarse - 1, P_coarse - 1};
+
+        // 获取本地所有权范围
+        PetscInt start_fine, end_fine, start_coarse, end_coarse;
+        VecGetOwnershipRange(x_fine, &start_fine, &end_fine);
+        VecGetOwnershipRange(x_coarse, &start_coarse, &end_coarse);
+
+        // 对于单进程情况，使用简单的直接访问
+        if (size == 1) {
+            PetscScalar* xf;
+            PetscScalar* xc;
+            VecGetArray(x_fine, &xf);
+            VecGetArray(x_coarse, &xc);
+
+            for (PetscInt k = 0; k < ne_coarse[2]; k++) {
+                for (PetscInt j = 0; j < ne_coarse[1]; j++) {
+                    for (PetscInt i = 0; i < ne_coarse[0]; i++) {
+                        PetscInt idx_coarse = i + j * ne_coarse[0] + k * ne_coarse[0] * ne_coarse[1];
+
+                        PetscScalar sum = 0.0;
+                        PetscInt count = 0;
+                        for (PetscInt kk = 0; kk < 2; kk++) {
+                            for (PetscInt jj = 0; jj < 2; jj++) {
+                                for (PetscInt ii = 0; ii < 2; ii++) {
+                                    PetscInt i_fine = 2 * i + ii;
+                                    PetscInt j_fine = 2 * j + jj;
+                                    PetscInt k_fine = 2 * k + kk;
+
+                                    if (i_fine < ne_fine[0] && j_fine < ne_fine[1] && k_fine < ne_fine[2]) {
+                                        PetscInt idx_fine = i_fine + j_fine * ne_fine[0] + k_fine * ne_fine[0] * ne_fine[1];
                                         sum += xf[idx_fine];
                                         count++;
                                     }
                                 }
                             }
                         }
+                        xc[idx_coarse] = (count > 0) ? (sum / count) : 0.5;
                     }
-                    
-                    xc[idx_coarse] = (count > 0) ? (sum / count) : 0.0;
                 }
             }
+
+            VecRestoreArray(x_fine, &xf);
+            VecRestoreArray(x_coarse, &xc);
+        } else {
+            // 多进程情况：使用VecScatter进行通信
+            // 首先，每个进程计算其本地粗网格单元需要的细网格单元
+            PetscInt local_coarse_size = end_coarse - start_coarse;
+
+            // 创建临时数组存储结果
+            PetscScalar* local_coarse_vals;
+            PetscMalloc1(local_coarse_size, &local_coarse_vals);
+
+            // 获取细网格的全局数据（通过scatter）
+            Vec x_fine_seq;
+            VecScatter scatter;
+            VecScatterCreateToAll(x_fine, &scatter, &x_fine_seq);
+            VecScatterBegin(scatter, x_fine, x_fine_seq, INSERT_VALUES, SCATTER_FORWARD);
+            VecScatterEnd(scatter, x_fine, x_fine_seq, INSERT_VALUES, SCATTER_FORWARD);
+
+            PetscScalar* xf_all;
+            VecGetArray(x_fine_seq, &xf_all);
+
+            // 计算本地粗网格单元的密度
+            for (PetscInt idx_local = 0; idx_local < local_coarse_size; idx_local++) {
+                PetscInt idx_global = start_coarse + idx_local;
+
+                // 将全局索引转换为(i,j,k)
+                PetscInt k = idx_global / (ne_coarse[0] * ne_coarse[1]);
+                PetscInt rem = idx_global % (ne_coarse[0] * ne_coarse[1]);
+                PetscInt j = rem / ne_coarse[0];
+                PetscInt i = rem % ne_coarse[0];
+
+                PetscScalar sum = 0.0;
+                PetscInt count = 0;
+                for (PetscInt kk = 0; kk < 2; kk++) {
+                    for (PetscInt jj = 0; jj < 2; jj++) {
+                        for (PetscInt ii = 0; ii < 2; ii++) {
+                            PetscInt i_fine = 2 * i + ii;
+                            PetscInt j_fine = 2 * j + jj;
+                            PetscInt k_fine = 2 * k + kk;
+
+                            if (i_fine < ne_fine[0] && j_fine < ne_fine[1] && k_fine < ne_fine[2]) {
+                                PetscInt idx_fine = i_fine + j_fine * ne_fine[0] + k_fine * ne_fine[0] * ne_fine[1];
+                                sum += xf_all[idx_fine];
+                                count++;
+                            }
+                        }
+                    }
+                }
+                local_coarse_vals[idx_local] = (count > 0) ? (sum / count) : 0.5;
+            }
+
+            VecRestoreArray(x_fine_seq, &xf_all);
+            VecScatterDestroy(&scatter);
+            VecDestroy(&x_fine_seq);
+
+            // 将结果写入粗网格向量
+            PetscScalar* xc;
+            VecGetArray(x_coarse, &xc);
+            for (PetscInt idx_local = 0; idx_local < local_coarse_size; idx_local++) {
+                xc[idx_local] = local_coarse_vals[idx_local];
+            }
+            VecRestoreArray(x_coarse, &xc);
+
+            PetscFree(local_coarse_vals);
         }
-        
-        VecRestoreArray(x_fine, &xf);
-        VecRestoreArray(x_coarse, &xc);
     }
-    
+
     return ierr;
 }
 
@@ -1392,86 +1795,71 @@ PetscErrorCode LinearElasticity::ComputeFixedDOFs_Level(DM dm, IS* fixed_is) {
     // 创建IS
     ierr = ISCreateGeneral(PETSC_COMM_WORLD, global_fixed_dofs.size(), global_fixed_dofs.data(), PETSC_COPY_VALUES, fixed_is);
     CHKERRQ(ierr);
-    
+
     return ierr;
 }
 
-// 组装指定层的粗网格刚度矩阵（几何重离散化）
-PetscErrorCode LinearElasticity::AssembleStiffnessMatrix_Level(PetscInt level, DM da_level, Vec xPhys_level,
-                                                                Mat K_level, Vec N_level,
-                                                                PetscScalar Emin, PetscScalar Emax, PetscScalar penal) {
+// ============================================================================
+// Matrix-Free: 创建Shell矩阵
+// ============================================================================
+PetscErrorCode LinearElasticity::CreateShellMatrix(DM da, Vec xPhys, Mat* A,
+                                                    PetscScalar Emin, PetscScalar Emax,
+                                                    PetscScalar penal, PetscInt level) {
     PetscErrorCode ierr;
-    
-    // 获取单元信息
+
+    // 获取矩阵大小
+    PetscInt M, N_nodes, P;
+    DMDAGetInfo(da, NULL, &M, &N_nodes, &P, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+
+    // 创建上下文
+    MatrixFreeContext* ctx = new MatrixFreeContext;
+    ctx->le = this;
+    ctx->xPhys = xPhys;
+    ctx->Emin = Emin;
+    ctx->Emax = Emax;
+    ctx->penal = penal;
+    ctx->da = da;
+    ctx->level = level;
+    ctx->gpu_res = NULL;
+
+    // 获取本地和全局大小
+    Vec tmp;
+    DMCreateGlobalVector(da, &tmp);
+    PetscInt local_size, global_size;
+    VecGetLocalSize(tmp, &local_size);
+    VecGetSize(tmp, &global_size);
+    VecDestroy(&tmp);
+
+    // 获取单元信息用于GPU初始化
     PetscInt nel, nen;
     const PetscInt* necon;
-    ierr = DMDAGetElements_3D(da_level, &nel, &nen, &necon);
-    CHKERRQ(ierr);
-    
-    // 获取密度指针
-    PetscScalar* xp;
-    VecGetArray(xPhys_level, &xp);
-    
-    // 清零矩阵
-    MatZeroEntries(K_level);
-    
-    // Edof数组
-    PetscInt edof[24];
-    PetscScalar ke[24 * 24];
-    
-    // 遍历单元
-    for (PetscInt i = 0; i < nel; i++) {
-        // 获取单元节点的自由度
-        for (PetscInt j = 0; j < nen; j++) {
-            for (PetscInt k = 0; k < 3; k++) {
-                edof[j * 3 + k] = 3 * necon[i * nen + j] + k;
-            }
-        }
-        
-        // 使用SIMP插值
-        PetscScalar dens = Emin + PetscPowScalar(xp[i], penal) * (Emax - Emin);
-        for (PetscInt k = 0; k < 24 * 24; k++) {
-            ke[k] = KE[k] * dens;
-        }
-        
-        // 添加到稀疏矩阵
-        ierr = MatSetValuesLocal(K_level, 24, edof, 24, edof, ke, ADD_VALUES);
-        CHKERRQ(ierr);
-    }
-    
-    MatAssemblyBegin(K_level, MAT_FINAL_ASSEMBLY);
-    MatAssemblyEnd(K_level, MAT_FINAL_ASSEMBLY);
-    
-    // ========== 关键修复：应用Dirichlet边界条件 ==========
-    // 计算该层的固定DOF
-    IS fixed_is;
-    ierr = ComputeFixedDOFs_Level(da_level, &fixed_is);
-    CHKERRQ(ierr);
-    
-    // 使用MatZeroRowsColumnsIS应用边界条件
-    // 这会将固定DOF对应的行和列清零，并在对角线上设置1.0
-    ierr = MatZeroRowsColumnsIS(K_level, fixed_is, 1.0, NULL, NULL);
-    CHKERRQ(ierr);
-    
-    // 清理
-    ISDestroy(&fixed_is);
-    VecRestoreArray(xPhys_level, &xp);
-    DMDARestoreElements(da_level, &nel, &nen, &necon);
-    
-    return ierr;
-}
+    ierr = DMDAGetElements_3D(da, &nel, &nen, &necon); CHKERRQ(ierr);
 
-// 组装所有层的刚度矩阵（已废弃 - 现在使用回调函数）
-PetscErrorCode LinearElasticity::AssembleAllLevels(Vec xPhys, PetscScalar Emin, PetscScalar Emax, PetscScalar penal) {
-    PetscErrorCode ierr;
-    
-    // 步骤1：密度限制
-    ierr = RestrictDensity(xPhys);
-    CHKERRQ(ierr);
-    
-    // 步骤2和3已由回调函数自动完成
-    // 不再需要手动组装和设置算子
-    
-    return ierr;
-}
+    // 获取局部向量大小（含ghost）
+    Vec tmp_local;
+    DMCreateLocalVector(da, &tmp_local);
+    PetscInt local_size_with_ghost;
+    VecGetSize(tmp_local, &local_size_with_ghost);
+    VecDestroy(&tmp_local);
 
+    // 初始化GPU资源
+    ierr = MatrixFreeGPU_Init(&ctx->gpu_res, KE, necon, nel,
+                              local_size_with_ghost, local_size); CHKERRQ(ierr);
+
+    DMDARestoreElements(da, &nel, &nen, &necon);
+
+    // 创建Shell矩阵
+    ierr = MatCreateShell(PETSC_COMM_WORLD, local_size, local_size,
+                          global_size, global_size, ctx, A); CHKERRQ(ierr);
+
+    // 设置矩阵-向量乘积函数
+    ierr = MatShellSetOperation(*A, MATOP_MULT, (void(*)(void))MatMult_MatrixFree); CHKERRQ(ierr);
+
+    // 设置获取对角线函数（用于Jacobi预条件器）
+    ierr = MatShellSetOperation(*A, MATOP_GET_DIAGONAL, (void(*)(void))MatGetDiagonal_MatrixFree); CHKERRQ(ierr);
+
+    // 设置销毁函数（清理上下文）
+    ierr = MatShellSetOperation(*A, MATOP_DESTROY, (void(*)(void))MatDestroy_MatrixFree); CHKERRQ(ierr);
+
+    return 0;
+}

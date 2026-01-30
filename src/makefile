@@ -14,14 +14,22 @@ MANSEC=
 CLEANFILES=
 NP=
 
+# CUDA编译器
+NVCC = nvcc
+NVCCFLAGS = -O3 -arch=sm_80 -I${PETSC_DIR}/include -I${PETSC_DIR}/${PETSC_ARCH}/include -I/home/user/openmpi-cuda/include -I/usr/local/cuda-12.2/include
+
 include ${PETSC_DIR}/lib/petsc/conf/variables
 include ${PETSC_DIR}/lib/petsc/conf/rules
 include ${PETSC_DIR}/lib/petsc/conf/test
 
-topopt: main.o TopOpt.o LinearElasticity.o MMA.o Filter.o PDEFilter.o MPIIO.o 
+# CUDA对象文件
+MatrixFreeGPU.o: MatrixFreeGPU.cu MatrixFreeGPU.h
+	${NVCC} ${NVCCFLAGS} -c MatrixFreeGPU.cu -o MatrixFreeGPU.o
+
+topopt: main.o TopOpt.o LinearElasticity.o MMA.o OC.o Filter.o PDEFilter.o MPIIO.o MatrixFreeGPU.o
 	rm -rf topopt
-	-${CLINKER} -o topopt main.o TopOpt.o LinearElasticity.o MMA.o Filter.o PDEFilter.o MPIIO.o ${PETSC_SYS_LIB}
-	${RM}  main.o TopOpt.o LinearElasticity.o MMA.o Filter.o PDEFilter.o MPIIO.o 
+	-${CLINKER} -o topopt main.o TopOpt.o LinearElasticity.o MMA.o OC.o Filter.o PDEFilter.o MPIIO.o MatrixFreeGPU.o ${PETSC_SYS_LIB} -lcudart
+	${RM}  main.o TopOpt.o LinearElasticity.o MMA.o OC.o Filter.o PDEFilter.o MPIIO.o MatrixFreeGPU.o
 	rm -rf *.o
 
 myclean:
