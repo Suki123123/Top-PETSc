@@ -18,7 +18,43 @@ free from errors. Furthermore, we shall not be liable in any event
 caused by the use of the program.
  */
 
-static char help[] = "3D TopOpt using KSP-MG on PETSc's DMDA (structured grids) \n";
+static char help[] = "3D TopOpt using KSP-MG on PETSc's DMDA (structured grids) \n"
+                     "Usage: mpirun -np <ngpu> ./topopt [options]\n"
+                     "Options:\n"
+                     "  -ngpu <1|2>         Number of GPUs (default: auto from MPI)\n"
+                     "  -output_vtk <0|1>   Output intermediate VTK files (default: 1)\n"
+                     "  -output_final <0|1> Output final VTK file (default: 1)\n"
+                     "  -use_oc             Use OC optimizer (default)\n"
+                     "  -use_mma            Use MMA optimizer\n"
+                     "  -nx, -ny, -nz       Mesh size\n"
+                     "  -volfrac            Volume fraction\n"
+                     "  -maxItr             Maximum iterations\n";
+
+// 设置GPU运行环境
+static PetscErrorCode SetupGPUEnvironment(int ngpu) {
+    PetscErrorCode ierr;
+
+    // 设置向量类型为CUDA
+    ierr = PetscOptionsSetValue(NULL, "-dm_vec_type", "cuda"); CHKERRQ(ierr);
+
+    // 设置求解器
+    ierr = PetscOptionsSetValue(NULL, "-ksp_type", "cg"); CHKERRQ(ierr);
+    ierr = PetscOptionsSetValue(NULL, "-ksp_rtol", "1e-5"); CHKERRQ(ierr);
+    ierr = PetscOptionsSetValue(NULL, "-ksp_max_it", "500"); CHKERRQ(ierr);
+    ierr = PetscOptionsSetValue(NULL, "-pc_type", "jacobi"); CHKERRQ(ierr);
+
+    // 默认使用OC优化器
+    ierr = PetscOptionsSetValue(NULL, "-use_oc", ""); CHKERRQ(ierr);
+
+    // 默认使用Matrix-Free
+    ierr = PetscOptionsSetValue(NULL, "-use_matrix_free", ""); CHKERRQ(ierr);
+
+    if (ngpu > 1) {
+        ierr = PetscOptionsSetValue(NULL, "-use_gpu_aware_mpi", "0"); CHKERRQ(ierr);
+    }
+
+    return 0;
+}
 
 int main(int argc, char* argv[]) {
 
@@ -27,6 +63,20 @@ int main(int argc, char* argv[]) {
 
     // Initialize PETSc / MPI and pass input arguments to PETSc
     PetscInitialize(&argc, &argv, PETSC_NULL, help);
+
+    // 获取MPI进程数作为默认GPU数
+    PetscMPIInt mpi_size;
+    MPI_Comm_size(PETSC_COMM_WORLD, &mpi_size);
+
+    // 获取ngpu参数（如果指定）
+    PetscInt ngpu = mpi_size;
+    PetscOptionsGetInt(NULL, NULL, "-ngpu", &ngpu, NULL);
+
+    // 设置GPU环境
+    ierr = SetupGPUEnvironment(ngpu); CHKERRQ(ierr);
+
+    // 打印GPU配置信息
+    PetscPrintf(PETSC_COMM_WORLD, "# Running with %d GPU(s)\n", mpi_size);
 
     // STEP 1: THE OPTIMIZATION PARAMETERS, DATA AND MESH (!!! THE DMDA !!!)
     TopOpt* opt = new TopOpt();
@@ -40,9 +90,24 @@ int main(int argc, char* argv[]) {
     // STEP 4: VISUALIZATION USING VTK
     MPIIO* output = new MPIIO(opt->da_nodes, 3, "ux, uy, uz", 3, "x, xTilde, xPhys");
     // STEP 5: THE OPTIMIZER MMA or OC
-    PetscBool use_oc = PETSC_FALSE;
-    PetscBool flg_oc;
+    PetscBool use_oc = PETSC_TRUE;   // 默认使用OC
+    PetscBool use_mma = PETSC_FALSE;
+    PetscBool flg_oc, flg_mma;
     PetscOptionsGetBool(NULL, NULL, "-use_oc", &use_oc, &flg_oc);
+    PetscOptionsGetBool(NULL, NULL, "-use_mma", &use_mma, &flg_mma);
+
+    // 如果指定了-use_mma，则使用MMA
+    if (flg_mma && use_mma) {
+        use_oc = PETSC_FALSE;
+    }
+
+    // VTK输出控制选项
+    PetscBool output_vtk = PETSC_TRUE;  // 默认输出VTK
+    PetscBool output_final_vtk = PETSC_TRUE;  // 默认输出最终VTK
+    PetscInt vtk_interval = 20;  // VTK输出间隔
+    PetscOptionsGetBool(NULL, NULL, "-output_vtk", &output_vtk, NULL);
+    PetscOptionsGetBool(NULL, NULL, "-output_final", &output_final_vtk, NULL);
+    PetscOptionsGetInt(NULL, NULL, "-vtk_interval", &vtk_interval, NULL);
 
     MMA*     mma = NULL;
     OC*      oc = NULL;
@@ -52,6 +117,7 @@ int main(int argc, char* argv[]) {
         PetscPrintf(PETSC_COMM_WORLD, "# Using OC (Optimality Criteria) optimizer\n");
         oc = new OC(opt->n, opt->x);
     } else {
+        PetscPrintf(PETSC_COMM_WORLD, "# Using MMA (Method of Moving Asymptotes) optimizer\n");
         opt->AllocateMMAwithRestart(&itr, &mma); // allow for restart !
     }
     // mma->SetAsymptotes(0.2, 0.65, 1.05);
@@ -130,8 +196,8 @@ int main(int argc, char* argv[]) {
                     "mnd.: %f, time: %f\n",
                     itr, opt->fx / opt->fscale, opt->fx, opt->gx[0], ch, mnd, t2 - t1);
 
-        // Write field data: first 10 iterations and then every 20th
-        if (itr < 11 || itr % 20 == 0 || changeBeta) {
+        // Write field data: first 10 iterations and then every vtk_interval
+        if (output_vtk && (itr < 11 || itr % vtk_interval == 0 || changeBeta)) {
             output->WriteVTK(physics->da_nodal, physics->GetStateField(), opt->x, opt->xTilde, opt->xPhys, itr);
         }
 
@@ -148,7 +214,9 @@ int main(int argc, char* argv[]) {
     physics->WriteRestartFiles();
 
     // Dump final design
-    output->WriteVTK(physics->da_nodal, physics->GetStateField(), opt->x, opt->xTilde, opt->xPhys, itr + 1);
+    if (output_final_vtk) {
+        output->WriteVTK(physics->da_nodal, physics->GetStateField(), opt->x, opt->xTilde, opt->xPhys, itr + 1);
+    }
 
     // STEP 7: CLEAN UP AFTER YOURSELF
     if (mma) delete mma;

@@ -840,16 +840,11 @@ PetscErrorCode LinearElasticity::ComputeObjectiveConstraintsSensitivities(PetscS
                                                  d_uloc, d_xPhys, Emin, Emax, penal);
         CHKERRQ(ierr);
 
-        // 将部分目标函数值复制回CPU并求和
-        PetscScalar* fx_partial = new PetscScalar[nel];
-        cudaMemcpy(fx_partial, d_fx_partial, nel * sizeof(PetscScalar), cudaMemcpyDeviceToHost);
-
-        for (PetscInt i = 0; i < nel; i++) {
-            fx[0] += fx_partial[i];
-        }
+        // 使用GPU归约计算fx的和
+        ierr = MatrixFreeGPU_ReduceSum(&fx[0], d_fx_partial, nel);
+        CHKERRQ(ierr);
 
         // 清理
-        delete[] fx_partial;
         cudaFree(d_fx_partial);
 
         // 恢复GPU指针

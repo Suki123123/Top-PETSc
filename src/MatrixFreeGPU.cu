@@ -7,6 +7,7 @@
 #include <cuda_runtime.h>
 #include <petsc.h>
 #include <petscvec.h>
+#include <mpi.h>
 
 // 单元刚度矩阵大小
 #define EDOF 24
@@ -369,6 +370,86 @@ PetscErrorCode MatrixFreeGPU_ComputeSensitivity(
 
     // 同步
     CUDA_CHECK(cudaStreamSynchronize(res->stream));
+
+    return 0;
+}
+
+/**
+ * GPU归约内核：计算数组元素之和
+ * 使用共享内存进行块内归约
+ */
+__global__ void ReduceSum_Kernel(
+    PetscScalar* __restrict__ output,
+    const PetscScalar* __restrict__ input,
+    PetscInt n)
+{
+    extern __shared__ PetscScalar sdata[];
+
+    unsigned int tid = threadIdx.x;
+    unsigned int i = blockIdx.x * blockDim.x * 2 + threadIdx.x;
+
+    // 每个线程加载两个元素到共享内存
+    PetscScalar sum = 0.0;
+    if (i < n) sum = input[i];
+    if (i + blockDim.x < n) sum += input[i + blockDim.x];
+    sdata[tid] = sum;
+    __syncthreads();
+
+    // 块内归约
+    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] += sdata[tid + s];
+        }
+        __syncthreads();
+    }
+
+    // 写入结果
+    if (tid == 0) {
+        output[blockIdx.x] = sdata[0];
+    }
+}
+
+/**
+ * GPU版本的数组求和（归约）
+ */
+PetscErrorCode MatrixFreeGPU_ReduceSum(
+    PetscScalar* result,
+    const PetscScalar* d_array,
+    PetscInt n)
+{
+    if (n <= 0) {
+        *result = 0.0;
+        return 0;
+    }
+
+    int blockSize = 256;
+    int numBlocks = (n + blockSize * 2 - 1) / (blockSize * 2);
+
+    // 分配临时GPU内存
+    PetscScalar* d_partial;
+    CUDA_CHECK(cudaMalloc(&d_partial, numBlocks * sizeof(PetscScalar)));
+
+    // 第一次归约
+    ReduceSum_Kernel<<<numBlocks, blockSize, blockSize * sizeof(PetscScalar)>>>(
+        d_partial, d_array, n);
+
+    // 如果还有多个块，继续归约
+    while (numBlocks > 1) {
+        int newNumBlocks = (numBlocks + blockSize * 2 - 1) / (blockSize * 2);
+        PetscScalar* d_partial2;
+        CUDA_CHECK(cudaMalloc(&d_partial2, newNumBlocks * sizeof(PetscScalar)));
+
+        ReduceSum_Kernel<<<newNumBlocks, blockSize, blockSize * sizeof(PetscScalar)>>>(
+            d_partial2, d_partial, numBlocks);
+
+        CUDA_CHECK(cudaFree(d_partial));
+        d_partial = d_partial2;
+        numBlocks = newNumBlocks;
+    }
+
+    // 复制结果到CPU
+    CUDA_CHECK(cudaMemcpy(result, d_partial, sizeof(PetscScalar), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaFree(d_partial));
 
     return 0;
 }
@@ -1035,6 +1116,1075 @@ PetscErrorCode VecGPU_PointwiseMultiply(
     VecPointwiseMultiply_Kernel<<<numBlocks, blockSize>>>(d_y, d_x, d_z, n);
     CUDA_CHECK(cudaDeviceSynchronize());
 
+    return 0;
+}
+
+// ============================================================================
+// MMA优化器相关GPU内核
+// ============================================================================
+
+/**
+ * GPU内核：MMA初始化渐近线（k < 3时）
+ * L[i] = x[i] - asyminit * (xmax[i] - xmin[i])
+ * U[i] = x[i] + asyminit * (xmax[i] - xmin[i])
+ */
+__global__ void MMA_InitAsymptotes_Kernel(
+    PetscScalar* __restrict__ L,
+    PetscScalar* __restrict__ U,
+    const PetscScalar* __restrict__ x,
+    const PetscScalar* __restrict__ xmin,
+    const PetscScalar* __restrict__ xmax,
+    PetscInt n,
+    PetscScalar asyminit)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+
+    PetscScalar xi = x[i];
+    PetscScalar diff = xmax[i] - xmin[i];
+    L[i] = xi - asyminit * diff;
+    U[i] = xi + asyminit * diff;
+}
+
+/**
+ * GPU内核：MMA更新渐近线（k >= 3时）
+ */
+__global__ void MMA_UpdateAsymptotes_Kernel(
+    PetscScalar* __restrict__ L,
+    PetscScalar* __restrict__ U,
+    const PetscScalar* __restrict__ x,
+    const PetscScalar* __restrict__ xo1,
+    const PetscScalar* __restrict__ xo2,
+    const PetscScalar* __restrict__ xmin,
+    const PetscScalar* __restrict__ xmax,
+    PetscInt n,
+    PetscScalar asymdec,
+    PetscScalar asyminc)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+
+    PetscScalar xi = x[i];
+    PetscScalar x1i = xo1[i];
+    PetscScalar x2i = xo2[i];
+    PetscScalar Li = L[i];
+    PetscScalar Ui = U[i];
+
+    PetscScalar helpvar = (xi - x1i) * (x1i - x2i);
+    PetscScalar gamma;
+    if (helpvar < 0.0) {
+        gamma = asymdec;
+    } else if (helpvar > 0.0) {
+        gamma = asyminc;
+    } else {
+        gamma = 1.0;
+    }
+
+    Li = xi - gamma * (x1i - Li);
+    Ui = xi + gamma * (Ui - x1i);
+
+    // 限制渐近线范围
+    PetscScalar xmi = max(1.0e-5, xmax[i] - xmin[i]);
+    Li = max(Li, xi - 10.0 * xmi);
+    Li = min(Li, xi - 0.01 * xmi);
+    Ui = max(Ui, xi + 0.01 * xmi);
+    Ui = min(Ui, xi + 10.0 * xmi);
+
+    L[i] = Li;
+    U[i] = Ui;
+}
+
+/**
+ * GPU内核：MMA计算alpha, beta, p0, q0
+ */
+__global__ void MMA_ComputeAlphaBetaPQ_Kernel(
+    PetscScalar* __restrict__ alpha,
+    PetscScalar* __restrict__ beta,
+    PetscScalar* __restrict__ p0,
+    PetscScalar* __restrict__ q0,
+    const PetscScalar* __restrict__ x,
+    const PetscScalar* __restrict__ L,
+    const PetscScalar* __restrict__ U,
+    const PetscScalar* __restrict__ xmin,
+    const PetscScalar* __restrict__ xmax,
+    const PetscScalar* __restrict__ dfdx,
+    PetscInt n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+
+    PetscScalar xi = x[i];
+    PetscScalar Li = L[i];
+    PetscScalar Ui = U[i];
+    PetscScalar df = dfdx[i];
+
+    // 计算alpha和beta
+    alpha[i] = max(xmin[i], 0.9 * Li + 0.1 * xi);
+    beta[i] = min(xmax[i], 0.9 * Ui + 0.1 * xi);
+
+    // 计算p0和q0
+    PetscScalar feps = 1.0e-6;
+    PetscScalar dfdxp = max(0.0, df);
+    PetscScalar dfdxm = max(0.0, -df);
+    PetscScalar UmX = Ui - xi;
+    PetscScalar XmL = xi - Li;
+    PetscScalar UmL = Ui - Li;
+
+    p0[i] = UmX * UmX * (dfdxp + 0.001 * fabs(df) + 0.5 * feps / UmL);
+    q0[i] = XmL * XmL * (dfdxm + 0.001 * fabs(df) + 0.5 * feps / UmL);
+}
+
+/**
+ * GPU内核：MMA计算pij和qij（约束敏感度）
+ */
+__global__ void MMA_ComputePijQij_Kernel(
+    PetscScalar* __restrict__ pij,
+    PetscScalar* __restrict__ qij,
+    const PetscScalar* __restrict__ x,
+    const PetscScalar* __restrict__ L,
+    const PetscScalar* __restrict__ U,
+    const PetscScalar* __restrict__ dgdx,
+    PetscInt n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+
+    PetscScalar xi = x[i];
+    PetscScalar Li = L[i];
+    PetscScalar Ui = U[i];
+    PetscScalar dg = dgdx[i];
+
+    PetscScalar UmX = Ui - xi;
+    PetscScalar XmL = xi - Li;
+
+    PetscScalar dgdxp = max(0.0, dg);
+    PetscScalar dgdxm = max(0.0, -dg);
+
+    pij[i] = UmX * UmX * dgdxp;
+    qij[i] = XmL * XmL * dgdxm;
+}
+
+/**
+ * GPU内核：MMA计算b的部分和
+ * b[j] = sum(pij[j][i] / (U[i] - x[i]) + qij[j][i] / (x[i] - L[i]))
+ */
+__global__ void MMA_ComputeB_Kernel(
+    PetscScalar* __restrict__ partial_sums,
+    const PetscScalar* __restrict__ pij,
+    const PetscScalar* __restrict__ qij,
+    const PetscScalar* __restrict__ x,
+    const PetscScalar* __restrict__ L,
+    const PetscScalar* __restrict__ U,
+    PetscInt n)
+{
+    extern __shared__ PetscScalar sdata[];
+
+    int tid = threadIdx.x;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    PetscScalar val = 0.0;
+    if (i < n) {
+        PetscScalar UmX = U[i] - x[i];
+        PetscScalar XmL = x[i] - L[i];
+        val = pij[i] / UmX + qij[i] / XmL;
+    }
+    sdata[tid] = val;
+    __syncthreads();
+
+    // 块内归约
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] += sdata[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        partial_sums[blockIdx.x] = sdata[0];
+    }
+}
+
+/**
+ * GPU内核：MMA XYZofLAMBDA - 根据lambda计算x
+ */
+__global__ void MMA_XYZofLAMBDA_Kernel(
+    PetscScalar* __restrict__ x,
+    const PetscScalar* __restrict__ p0,
+    const PetscScalar* __restrict__ q0,
+    const PetscScalar* __restrict__ pij,
+    const PetscScalar* __restrict__ qij,
+    const PetscScalar* __restrict__ alpha,
+    const PetscScalar* __restrict__ beta,
+    const PetscScalar* __restrict__ L,
+    const PetscScalar* __restrict__ U,
+    PetscInt n,
+    PetscScalar lam)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+
+    PetscScalar pjlam = p0[i] + pij[i] * lam;
+    PetscScalar qjlam = q0[i] + qij[i] * lam;
+
+    PetscScalar sqp = sqrt(pjlam);
+    PetscScalar sqq = sqrt(qjlam);
+
+    PetscScalar xi = (sqp * L[i] + sqq * U[i]) / (sqp + sqq);
+
+    // 限制到[alpha, beta]
+    if (xi < alpha[i]) xi = alpha[i];
+    if (xi > beta[i]) xi = beta[i];
+
+    x[i] = xi;
+}
+
+/**
+ * GPU内核：MMA XYZofLAMBDA - 从GPU数组读取lam（避免CPU-GPU通信）
+ */
+__global__ void MMA_XYZofLAMBDA_FromGPU_Kernel(
+    PetscScalar* __restrict__ x,
+    const PetscScalar* __restrict__ p0,
+    const PetscScalar* __restrict__ q0,
+    const PetscScalar* __restrict__ pij,
+    const PetscScalar* __restrict__ qij,
+    const PetscScalar* __restrict__ alpha,
+    const PetscScalar* __restrict__ beta,
+    const PetscScalar* __restrict__ L,
+    const PetscScalar* __restrict__ U,
+    const PetscScalar* __restrict__ d_lam,
+    PetscInt n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+
+    PetscScalar lam = d_lam[0];
+    PetscScalar pjlam = p0[i] + pij[i] * lam;
+    PetscScalar qjlam = q0[i] + qij[i] * lam;
+
+    PetscScalar sqp = sqrt(pjlam);
+    PetscScalar sqq = sqrt(qjlam);
+
+    PetscScalar xi = (sqp * L[i] + sqq * U[i]) / (sqp + sqq);
+
+    // 限制到[alpha, beta]
+    if (xi < alpha[i]) xi = alpha[i];
+    if (xi > beta[i]) xi = beta[i];
+
+    x[i] = xi;
+}
+
+/**
+ * GPU内核：MMA DualGrad - 计算对偶梯度的部分和
+ */
+__global__ void MMA_DualGrad_Kernel(
+    PetscScalar* __restrict__ partial_sums,
+    const PetscScalar* __restrict__ pij,
+    const PetscScalar* __restrict__ qij,
+    const PetscScalar* __restrict__ x,
+    const PetscScalar* __restrict__ L,
+    const PetscScalar* __restrict__ U,
+    PetscInt n)
+{
+    extern __shared__ PetscScalar sdata[];
+
+    int tid = threadIdx.x;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    PetscScalar val = 0.0;
+    if (i < n) {
+        PetscScalar UmX = U[i] - x[i];
+        PetscScalar XmL = x[i] - L[i];
+        val = pij[i] / UmX + qij[i] / XmL;
+    }
+    sdata[tid] = val;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] += sdata[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        partial_sums[blockIdx.x] = sdata[0];
+    }
+}
+
+/**
+ * GPU内核：MMA DualHess - 计算df2和PQ
+ */
+__global__ void MMA_DualHess_df2PQ_Kernel(
+    PetscScalar* __restrict__ df2,
+    PetscScalar* __restrict__ PQ,
+    const PetscScalar* __restrict__ x,
+    const PetscScalar* __restrict__ p0,
+    const PetscScalar* __restrict__ q0,
+    const PetscScalar* __restrict__ pij,
+    const PetscScalar* __restrict__ qij,
+    const PetscScalar* __restrict__ alpha,
+    const PetscScalar* __restrict__ beta,
+    const PetscScalar* __restrict__ L,
+    const PetscScalar* __restrict__ U,
+    PetscInt n,
+    PetscScalar lam)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+
+    PetscScalar xi = x[i];
+    PetscScalar Li = L[i];
+    PetscScalar Ui = U[i];
+    PetscScalar UmX = Ui - xi;
+    PetscScalar XmL = xi - Li;
+
+    PetscScalar pjlam = p0[i] + pij[i] * lam;
+    PetscScalar qjlam = q0[i] + qij[i] * lam;
+
+    // 计算PQ
+    PQ[i] = pij[i] / (UmX * UmX) - qij[i] / (XmL * XmL);
+
+    // 计算df2
+    PetscScalar df2_val = -1.0 / (2.0 * pjlam / (UmX * UmX * UmX) + 2.0 * qjlam / (XmL * XmL * XmL));
+
+    // 检查是否在边界
+    PetscScalar sqp = sqrt(pjlam);
+    PetscScalar sqq = sqrt(qjlam);
+    PetscScalar xp = (sqp * Li + sqq * Ui) / (sqp + sqq);
+    if (xp < alpha[i] || xp > beta[i]) {
+        df2_val = 0.0;
+    }
+
+    df2[i] = df2_val;
+}
+
+/**
+ * GPU内核：MMA DualHess - 计算Hessian元素（单约束情况）
+ */
+__global__ void MMA_DualHess_Hess_Kernel(
+    PetscScalar* __restrict__ partial_sums,
+    const PetscScalar* __restrict__ df2,
+    const PetscScalar* __restrict__ PQ,
+    PetscInt n)
+{
+    extern __shared__ PetscScalar sdata[];
+
+    int tid = threadIdx.x;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    PetscScalar val = 0.0;
+    if (i < n) {
+        val = PQ[i] * df2[i] * PQ[i];
+    }
+    sdata[tid] = val;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] += sdata[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        partial_sums[blockIdx.x] = sdata[0];
+    }
+}
+
+/**
+ * GPU内核：MMA DualResidual - 计算残差的部分和
+ */
+__global__ void MMA_DualResidual_Kernel(
+    PetscScalar* __restrict__ partial_sums,
+    const PetscScalar* __restrict__ pij,
+    const PetscScalar* __restrict__ qij,
+    const PetscScalar* __restrict__ x,
+    const PetscScalar* __restrict__ L,
+    const PetscScalar* __restrict__ U,
+    PetscInt n)
+{
+    extern __shared__ PetscScalar sdata[];
+
+    int tid = threadIdx.x;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    PetscScalar val = 0.0;
+    if (i < n) {
+        PetscScalar UmX = U[i] - x[i];
+        PetscScalar XmL = x[i] - L[i];
+        val = pij[i] / UmX + qij[i] / XmL;
+    }
+    sdata[tid] = val;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] += sdata[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        partial_sums[blockIdx.x] = sdata[0];
+    }
+}
+
+// ============================================================================
+// MMA优化器C接口函数
+// ============================================================================
+
+/**
+ * GPU版本的MMA初始化渐近线
+ */
+PetscErrorCode MMAGPU_InitAsymptotes(
+    PetscScalar* d_L,
+    PetscScalar* d_U,
+    const PetscScalar* d_x,
+    const PetscScalar* d_xmin,
+    const PetscScalar* d_xmax,
+    PetscInt n,
+    PetscScalar asyminit)
+{
+    int blockSize = 256;
+    int numBlocks = (n + blockSize - 1) / blockSize;
+
+    MMA_InitAsymptotes_Kernel<<<numBlocks, blockSize>>>(
+        d_L, d_U, d_x, d_xmin, d_xmax, n, asyminit);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    return 0;
+}
+
+/**
+ * GPU版本的MMA更新渐近线
+ */
+PetscErrorCode MMAGPU_UpdateAsymptotes(
+    PetscScalar* d_L,
+    PetscScalar* d_U,
+    const PetscScalar* d_x,
+    const PetscScalar* d_xo1,
+    const PetscScalar* d_xo2,
+    const PetscScalar* d_xmin,
+    const PetscScalar* d_xmax,
+    PetscInt n,
+    PetscScalar asymdec,
+    PetscScalar asyminc)
+{
+    int blockSize = 256;
+    int numBlocks = (n + blockSize - 1) / blockSize;
+
+    MMA_UpdateAsymptotes_Kernel<<<numBlocks, blockSize>>>(
+        d_L, d_U, d_x, d_xo1, d_xo2, d_xmin, d_xmax, n, asymdec, asyminc);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    return 0;
+}
+
+/**
+ * GPU版本的MMA计算alpha, beta, p0, q0
+ */
+PetscErrorCode MMAGPU_ComputeAlphaBetaPQ(
+    PetscScalar* d_alpha,
+    PetscScalar* d_beta,
+    PetscScalar* d_p0,
+    PetscScalar* d_q0,
+    const PetscScalar* d_x,
+    const PetscScalar* d_L,
+    const PetscScalar* d_U,
+    const PetscScalar* d_xmin,
+    const PetscScalar* d_xmax,
+    const PetscScalar* d_dfdx,
+    PetscInt n)
+{
+    int blockSize = 256;
+    int numBlocks = (n + blockSize - 1) / blockSize;
+
+    MMA_ComputeAlphaBetaPQ_Kernel<<<numBlocks, blockSize>>>(
+        d_alpha, d_beta, d_p0, d_q0, d_x, d_L, d_U, d_xmin, d_xmax, d_dfdx, n);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    return 0;
+}
+
+/**
+ * GPU版本的MMA计算pij和qij
+ */
+PetscErrorCode MMAGPU_ComputePijQij(
+    PetscScalar* d_pij,
+    PetscScalar* d_qij,
+    const PetscScalar* d_x,
+    const PetscScalar* d_L,
+    const PetscScalar* d_U,
+    const PetscScalar* d_dgdx,
+    PetscInt n)
+{
+    int blockSize = 256;
+    int numBlocks = (n + blockSize - 1) / blockSize;
+
+    MMA_ComputePijQij_Kernel<<<numBlocks, blockSize>>>(
+        d_pij, d_qij, d_x, d_L, d_U, d_dgdx, n);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    return 0;
+}
+
+/**
+ * GPU版本的MMA计算b
+ */
+PetscErrorCode MMAGPU_ComputeB(
+    PetscScalar* result,
+    const PetscScalar* d_pij,
+    const PetscScalar* d_qij,
+    const PetscScalar* d_x,
+    const PetscScalar* d_L,
+    const PetscScalar* d_U,
+    PetscInt n)
+{
+    int blockSize = 256;
+    int numBlocks = (n + blockSize - 1) / blockSize;
+
+    PetscScalar* d_partial_sums;
+    CUDA_CHECK(cudaMalloc(&d_partial_sums, numBlocks * sizeof(PetscScalar)));
+
+    MMA_ComputeB_Kernel<<<numBlocks, blockSize, blockSize * sizeof(PetscScalar)>>>(
+        d_partial_sums, d_pij, d_qij, d_x, d_L, d_U, n);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    PetscScalar* h_partial_sums = new PetscScalar[numBlocks];
+    CUDA_CHECK(cudaMemcpy(h_partial_sums, d_partial_sums,
+                          numBlocks * sizeof(PetscScalar), cudaMemcpyDeviceToHost));
+
+    PetscScalar sum = 0.0;
+    for (int i = 0; i < numBlocks; i++) {
+        sum += h_partial_sums[i];
+    }
+    *result = sum;
+
+    delete[] h_partial_sums;
+    cudaFree(d_partial_sums);
+
+    return 0;
+}
+
+/**
+ * GPU版本的MMA XYZofLAMBDA
+ */
+PetscErrorCode MMAGPU_XYZofLAMBDA(
+    PetscScalar* d_x,
+    const PetscScalar* d_p0,
+    const PetscScalar* d_q0,
+    const PetscScalar* d_pij,
+    const PetscScalar* d_qij,
+    const PetscScalar* d_alpha,
+    const PetscScalar* d_beta,
+    const PetscScalar* d_L,
+    const PetscScalar* d_U,
+    PetscInt n,
+    PetscScalar lam)
+{
+    int blockSize = 256;
+    int numBlocks = (n + blockSize - 1) / blockSize;
+
+    MMA_XYZofLAMBDA_Kernel<<<numBlocks, blockSize>>>(
+        d_x, d_p0, d_q0, d_pij, d_qij, d_alpha, d_beta, d_L, d_U, n, lam);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    return 0;
+}
+
+/**
+ * GPU版本的MMA DualGrad
+ */
+PetscErrorCode MMAGPU_DualGrad(
+    PetscScalar* result,
+    const PetscScalar* d_pij,
+    const PetscScalar* d_qij,
+    const PetscScalar* d_x,
+    const PetscScalar* d_L,
+    const PetscScalar* d_U,
+    PetscInt n)
+{
+    int blockSize = 256;
+    int numBlocks = (n + blockSize - 1) / blockSize;
+
+    PetscScalar* d_partial_sums;
+    CUDA_CHECK(cudaMalloc(&d_partial_sums, numBlocks * sizeof(PetscScalar)));
+
+    MMA_DualGrad_Kernel<<<numBlocks, blockSize, blockSize * sizeof(PetscScalar)>>>(
+        d_partial_sums, d_pij, d_qij, d_x, d_L, d_U, n);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    PetscScalar* h_partial_sums = new PetscScalar[numBlocks];
+    CUDA_CHECK(cudaMemcpy(h_partial_sums, d_partial_sums,
+                          numBlocks * sizeof(PetscScalar), cudaMemcpyDeviceToHost));
+
+    PetscScalar sum = 0.0;
+    for (int i = 0; i < numBlocks; i++) {
+        sum += h_partial_sums[i];
+    }
+    *result = sum;
+
+    delete[] h_partial_sums;
+    cudaFree(d_partial_sums);
+
+    return 0;
+}
+
+/**
+ * GPU版本的MMA DualHess（单约束情况）
+ */
+PetscErrorCode MMAGPU_DualHess(
+    PetscScalar* result,
+    PetscScalar* d_df2,
+    PetscScalar* d_PQ,
+    const PetscScalar* d_x,
+    const PetscScalar* d_p0,
+    const PetscScalar* d_q0,
+    const PetscScalar* d_pij,
+    const PetscScalar* d_qij,
+    const PetscScalar* d_alpha,
+    const PetscScalar* d_beta,
+    const PetscScalar* d_L,
+    const PetscScalar* d_U,
+    PetscInt n,
+    PetscScalar lam)
+{
+    int blockSize = 256;
+    int numBlocks = (n + blockSize - 1) / blockSize;
+
+    // 计算df2和PQ
+    MMA_DualHess_df2PQ_Kernel<<<numBlocks, blockSize>>>(
+        d_df2, d_PQ, d_x, d_p0, d_q0, d_pij, d_qij, d_alpha, d_beta, d_L, d_U, n, lam);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // 计算Hessian元素
+    PetscScalar* d_partial_sums;
+    CUDA_CHECK(cudaMalloc(&d_partial_sums, numBlocks * sizeof(PetscScalar)));
+
+    MMA_DualHess_Hess_Kernel<<<numBlocks, blockSize, blockSize * sizeof(PetscScalar)>>>(
+        d_partial_sums, d_df2, d_PQ, n);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    PetscScalar* h_partial_sums = new PetscScalar[numBlocks];
+    CUDA_CHECK(cudaMemcpy(h_partial_sums, d_partial_sums,
+                          numBlocks * sizeof(PetscScalar), cudaMemcpyDeviceToHost));
+
+    PetscScalar sum = 0.0;
+    for (int i = 0; i < numBlocks; i++) {
+        sum += h_partial_sums[i];
+    }
+    *result = sum;
+
+    delete[] h_partial_sums;
+    cudaFree(d_partial_sums);
+
+    return 0;
+}
+
+// ============================================================================
+// MMA SolveDIP GPU内核（完全在GPU上执行）
+// ============================================================================
+
+/**
+ * GPU内核：DualGrad直接写入GPU数组
+ */
+PetscErrorCode MMAGPU_DualGrad_ToGPU(
+    PetscScalar* d_grad,        // 输出：GPU上的grad数组
+    const PetscScalar* d_pij,
+    const PetscScalar* d_qij,
+    const PetscScalar* d_x,
+    const PetscScalar* d_L,
+    const PetscScalar* d_U,
+    PetscInt n)
+{
+    int blockSize = 256;
+    int numBlocks = (n + blockSize - 1) / blockSize;
+
+    PetscScalar* d_partial_sums;
+    CUDA_CHECK(cudaMalloc(&d_partial_sums, numBlocks * sizeof(PetscScalar)));
+
+    MMA_DualGrad_Kernel<<<numBlocks, blockSize, blockSize * sizeof(PetscScalar)>>>(
+        d_partial_sums, d_pij, d_qij, d_x, d_L, d_U, n);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // 继续归约到单个值
+    while (numBlocks > 1) {
+        int newNumBlocks = (numBlocks + blockSize * 2 - 1) / (blockSize * 2);
+        PetscScalar* d_partial2;
+        CUDA_CHECK(cudaMalloc(&d_partial2, newNumBlocks * sizeof(PetscScalar)));
+        ReduceSum_Kernel<<<newNumBlocks, blockSize, blockSize * sizeof(PetscScalar)>>>(
+            d_partial2, d_partial_sums, numBlocks);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        cudaFree(d_partial_sums);
+        d_partial_sums = d_partial2;
+        numBlocks = newNumBlocks;
+    }
+
+    // 复制结果到d_grad[0]
+    CUDA_CHECK(cudaMemcpy(d_grad, d_partial_sums, sizeof(PetscScalar), cudaMemcpyDeviceToDevice));
+    cudaFree(d_partial_sums);
+
+    return 0;
+}
+
+/**
+ * GPU内核：DualHess直接写入GPU数组
+ */
+PetscErrorCode MMAGPU_DualHess_ToGPU(
+    PetscScalar* d_Hess,        // 输出：GPU上的Hess数组
+    PetscScalar* d_df2,
+    PetscScalar* d_PQ,
+    const PetscScalar* d_x,
+    const PetscScalar* d_p0,
+    const PetscScalar* d_q0,
+    const PetscScalar* d_pij,
+    const PetscScalar* d_qij,
+    const PetscScalar* d_alpha,
+    const PetscScalar* d_beta,
+    const PetscScalar* d_L,
+    const PetscScalar* d_U,
+    PetscInt n,
+    PetscScalar lam)
+{
+    int blockSize = 256;
+    int numBlocks = (n + blockSize - 1) / blockSize;
+
+    // 计算df2和PQ
+    MMA_DualHess_df2PQ_Kernel<<<numBlocks, blockSize>>>(
+        d_df2, d_PQ, d_x, d_p0, d_q0, d_pij, d_qij, d_alpha, d_beta, d_L, d_U, n, lam);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // 计算Hessian元素
+    PetscScalar* d_partial_sums;
+    CUDA_CHECK(cudaMalloc(&d_partial_sums, numBlocks * sizeof(PetscScalar)));
+
+    MMA_DualHess_Hess_Kernel<<<numBlocks, blockSize, blockSize * sizeof(PetscScalar)>>>(
+        d_partial_sums, d_df2, d_PQ, n);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // 继续归约
+    while (numBlocks > 1) {
+        int newNumBlocks = (numBlocks + blockSize * 2 - 1) / (blockSize * 2);
+        PetscScalar* d_partial2;
+        CUDA_CHECK(cudaMalloc(&d_partial2, newNumBlocks * sizeof(PetscScalar)));
+        ReduceSum_Kernel<<<newNumBlocks, blockSize, blockSize * sizeof(PetscScalar)>>>(
+            d_partial2, d_partial_sums, numBlocks);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        cudaFree(d_partial_sums);
+        d_partial_sums = d_partial2;
+        numBlocks = newNumBlocks;
+    }
+
+    // 复制结果到d_Hess[0]
+    CUDA_CHECK(cudaMemcpy(d_Hess, d_partial_sums, sizeof(PetscScalar), cudaMemcpyDeviceToDevice));
+    cudaFree(d_partial_sums);
+
+    return 0;
+}
+
+/**
+ * GPU内核：SolveDIP的标量运算（m=1情况）
+ * 执行：grad更新、Factorize/Solve、s计算、LineSearch
+ */
+__global__ void MMA_SolveDIP_ScalarOps_Kernel(
+    PetscScalar* __restrict__ d_lam,
+    PetscScalar* __restrict__ d_mu,
+    PetscScalar* __restrict__ d_grad,
+    PetscScalar* __restrict__ d_Hess,
+    PetscScalar* __restrict__ d_s,
+    PetscScalar* __restrict__ d_y,
+    PetscScalar* __restrict__ d_z,
+    const PetscScalar* __restrict__ d_a,
+    const PetscScalar* __restrict__ d_b,
+    const PetscScalar* __restrict__ d_c,
+    PetscScalar epsi)
+{
+    // 只需要一个线程
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+
+    PetscScalar lam = d_lam[0];
+    PetscScalar mu = d_mu[0];
+    PetscScalar grad = d_grad[0];
+    PetscScalar Hess = d_Hess[0];
+    PetscScalar a = d_a[0];
+    PetscScalar b = d_b[0];
+    PetscScalar c = d_c[0];
+
+    // 更新y和z
+    if (lam < 0.0) lam = 0.0;
+    PetscScalar y = max(0.0, lam - c);
+    PetscScalar lamai = lam * a;
+    PetscScalar z = max(0.0, 10.0 * (lamai - 1.0));
+
+    // 完成grad计算
+    grad = grad - b - a * z - y;
+
+    // 更新grad（Newton方向）
+    grad = -grad - epsi / lam;
+
+    // 应用Hess修正
+    if (lam > c) {
+        Hess += -1.0;
+    }
+    Hess += -mu / lam;
+    if (lamai > 0.0) {
+        Hess += -10.0 * a * a;
+    }
+    PetscScalar HessCorr = 1e-4 * Hess;
+    if (-HessCorr < 1.0e-7) {
+        HessCorr = -1.0e-7;
+    }
+    Hess += HessCorr;
+
+    // Solve（对于m=1就是除法）
+    PetscScalar s0 = grad / Hess;
+    PetscScalar s1 = -mu + epsi / lam - s0 * mu / lam;
+
+    // LineSearch
+    PetscScalar theta = 1.005;
+    if (theta < -1.01 * s0 / lam) {
+        theta = -1.01 * s0 / lam;
+    }
+    if (theta < -1.01 * s1 / mu) {
+        theta = -1.01 * s1 / mu;
+    }
+    theta = 1.0 / theta;
+
+    lam = lam + theta * s0;
+    mu = mu + theta * s1;
+
+    // 写回结果
+    d_lam[0] = lam;
+    d_mu[0] = mu;
+    d_y[0] = y;
+    d_z[0] = z;
+    d_s[0] = s0;
+    d_s[1] = s1;
+}
+
+/**
+ * GPU内核：计算DualResidual
+ */
+__global__ void MMA_DualResidual_Scalar_Kernel(
+    PetscScalar* __restrict__ d_err,
+    PetscScalar grad_sum,
+    const PetscScalar* __restrict__ d_lam,
+    const PetscScalar* __restrict__ d_mu,
+    const PetscScalar* __restrict__ d_a,
+    const PetscScalar* __restrict__ d_b,
+    const PetscScalar* __restrict__ d_y,
+    const PetscScalar* __restrict__ d_z,
+    PetscScalar epsi)
+{
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+
+    PetscScalar lam = d_lam[0];
+    PetscScalar mu = d_mu[0];
+    PetscScalar a = d_a[0];
+    PetscScalar b = d_b[0];
+    PetscScalar y = d_y[0];
+    PetscScalar z = d_z[0];
+
+    PetscScalar res0 = grad_sum - b - a * z - y + mu;
+    PetscScalar res1 = mu * lam - epsi;
+
+    PetscScalar nrI = fabs(res0);
+    if (fabs(res1) > nrI) nrI = fabs(res1);
+
+    d_err[0] = nrI;
+}
+
+/**
+ * GPU内核：更新y和z
+ */
+__global__ void MMA_UpdateYZ_Kernel(
+    PetscScalar* __restrict__ d_y,
+    PetscScalar* __restrict__ d_z,
+    const PetscScalar* __restrict__ d_lam,
+    const PetscScalar* __restrict__ d_a,
+    const PetscScalar* __restrict__ d_c)
+{
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+
+    PetscScalar lam = d_lam[0];
+    if (lam < 0.0) lam = 0.0;
+    d_y[0] = max(0.0, lam - d_c[0]);
+    PetscScalar lamai = lam * d_a[0];
+    d_z[0] = max(0.0, 10.0 * (lamai - 1.0));
+}
+
+/**
+ * GPU版本的完整SolveDIP（单约束m=1情况）
+ * 在GPU上执行大部分计算，MPI通信时需要CPU参与
+ */
+PetscErrorCode MMAGPU_SolveDIP(
+    PetscScalar* d_x,           // 输入/输出：设计变量
+    PetscScalar* d_lam,         // 输入/输出：拉格朗日乘子
+    PetscScalar* d_mu,          // 输入/输出：对偶变量
+    PetscScalar* d_y,           // 工作空间
+    PetscScalar* d_z,           // 工作空间（单个标量）
+    PetscScalar* d_grad,        // 工作空间
+    PetscScalar* d_Hess,        // 工作空间
+    PetscScalar* d_s,           // 工作空间
+    PetscScalar* d_a,           // 参数
+    PetscScalar* d_b,           // 参数
+    PetscScalar* d_c,           // 参数
+    const PetscScalar* d_p0,
+    const PetscScalar* d_q0,
+    const PetscScalar* d_pij,
+    const PetscScalar* d_qij,
+    const PetscScalar* d_alpha,
+    const PetscScalar* d_beta,
+    const PetscScalar* d_L,
+    const PetscScalar* d_U,
+    PetscScalar* d_df2,         // 工作空间
+    PetscScalar* d_PQ,          // 工作空间
+    PetscInt n,
+    PetscInt m)
+{
+    // 只支持m=1
+    if (m != 1) {
+        PetscPrintf(PETSC_COMM_WORLD, "MMAGPU_SolveDIP only supports m=1\n");
+        return PETSC_ERR_SUP;
+    }
+
+    PetscScalar tol = 1.0e-9 * sqrt((PetscScalar)(m + n));
+    PetscScalar epsi = 1.0;
+
+    // 临时变量用于归约结果
+    PetscScalar* d_err;
+    CUDA_CHECK(cudaMalloc(&d_err, sizeof(PetscScalar)));
+
+    // 预分配归约用的临时数组
+    int blockSize = 256;
+    int numBlocks = (n + blockSize - 1) / blockSize;
+    PetscScalar* d_partial_sums;
+    CUDA_CHECK(cudaMalloc(&d_partial_sums, numBlocks * sizeof(PetscScalar)));
+
+    while (epsi > tol) {
+        PetscScalar err = 1.0;
+        int loop = 0;
+
+        while (err > 0.9 * epsi && loop < 100) {
+            loop++;
+
+            // 1. 更新y和z（从GPU数组读取lam）
+            MMA_UpdateYZ_Kernel<<<1, 1>>>(d_y, d_z, d_lam, d_a, d_c);
+
+            // 2. XYZofLAMBDA - 使用从GPU数组读取lam的版本
+            MMA_XYZofLAMBDA_FromGPU_Kernel<<<numBlocks, blockSize>>>(
+                d_x, d_p0, d_q0, d_pij, d_qij, d_alpha, d_beta, d_L, d_U, d_lam, n);
+
+            // 3. DualGrad - 本地归约
+            MMA_DualGrad_Kernel<<<numBlocks, blockSize, blockSize * sizeof(PetscScalar)>>>(
+                d_partial_sums, d_pij, d_qij, d_x, d_L, d_U, n);
+            CUDA_CHECK(cudaDeviceSynchronize());
+
+            // 本地归约
+            int nb = numBlocks;
+            PetscScalar* d_current = d_partial_sums;
+            PetscScalar* d_temp = NULL;
+            while (nb > 1) {
+                int newNb = (nb + blockSize * 2 - 1) / (blockSize * 2);
+                CUDA_CHECK(cudaMalloc(&d_temp, newNb * sizeof(PetscScalar)));
+                ReduceSum_Kernel<<<newNb, blockSize, blockSize * sizeof(PetscScalar)>>>(
+                    d_temp, d_current, nb);
+                CUDA_CHECK(cudaDeviceSynchronize());
+                if (d_current != d_partial_sums) cudaFree(d_current);
+                d_current = d_temp;
+                nb = newNb;
+            }
+            PetscScalar grad_local;
+            CUDA_CHECK(cudaMemcpy(&grad_local, d_current, sizeof(PetscScalar), cudaMemcpyDeviceToHost));
+            if (d_current != d_partial_sums) cudaFree(d_current);
+
+            // MPI归约
+            PetscScalar grad_global;
+            MPI_Allreduce(&grad_local, &grad_global, 1, MPIU_SCALAR, MPI_SUM, PETSC_COMM_WORLD);
+            CUDA_CHECK(cudaMemcpy(d_grad, &grad_global, sizeof(PetscScalar), cudaMemcpyHostToDevice));
+
+            // 4. DualHess - 需要lam值
+            PetscScalar lam_host;
+            CUDA_CHECK(cudaMemcpy(&lam_host, d_lam, sizeof(PetscScalar), cudaMemcpyDeviceToHost));
+
+            // 计算df2和PQ
+            MMA_DualHess_df2PQ_Kernel<<<numBlocks, blockSize>>>(
+                d_df2, d_PQ, d_x, d_p0, d_q0, d_pij, d_qij, d_alpha, d_beta, d_L, d_U, n, lam_host);
+            CUDA_CHECK(cudaDeviceSynchronize());
+
+            // 计算Hessian元素（本地归约）
+            MMA_DualHess_Hess_Kernel<<<numBlocks, blockSize, blockSize * sizeof(PetscScalar)>>>(
+                d_partial_sums, d_df2, d_PQ, n);
+            CUDA_CHECK(cudaDeviceSynchronize());
+
+            nb = numBlocks;
+            d_current = d_partial_sums;
+            d_temp = NULL;
+            while (nb > 1) {
+                int newNb = (nb + blockSize * 2 - 1) / (blockSize * 2);
+                CUDA_CHECK(cudaMalloc(&d_temp, newNb * sizeof(PetscScalar)));
+                ReduceSum_Kernel<<<newNb, blockSize, blockSize * sizeof(PetscScalar)>>>(
+                    d_temp, d_current, nb);
+                CUDA_CHECK(cudaDeviceSynchronize());
+                if (d_current != d_partial_sums) cudaFree(d_current);
+                d_current = d_temp;
+                nb = newNb;
+            }
+            PetscScalar hess_local;
+            CUDA_CHECK(cudaMemcpy(&hess_local, d_current, sizeof(PetscScalar), cudaMemcpyDeviceToHost));
+            if (d_current != d_partial_sums) cudaFree(d_current);
+
+            // MPI归约
+            PetscScalar hess_global;
+            MPI_Allreduce(&hess_local, &hess_global, 1, MPIU_SCALAR, MPI_SUM, PETSC_COMM_WORLD);
+            CUDA_CHECK(cudaMemcpy(d_Hess, &hess_global, sizeof(PetscScalar), cudaMemcpyHostToDevice));
+
+            // 5. 标量运算（grad更新、Solve、LineSearch）- 完全在GPU上
+            MMA_SolveDIP_ScalarOps_Kernel<<<1, 1>>>(
+                d_lam, d_mu, d_grad, d_Hess, d_s, d_y, d_z, d_a, d_b, d_c, epsi);
+
+            // 6. 再次更新y和z，然后XYZofLAMBDA（使用GPU版本）
+            MMA_UpdateYZ_Kernel<<<1, 1>>>(d_y, d_z, d_lam, d_a, d_c);
+            MMA_XYZofLAMBDA_FromGPU_Kernel<<<numBlocks, blockSize>>>(
+                d_x, d_p0, d_q0, d_pij, d_qij, d_alpha, d_beta, d_L, d_U, d_lam, n);
+
+            // 7. DualResidual - 计算grad_sum
+            MMA_DualGrad_Kernel<<<numBlocks, blockSize, blockSize * sizeof(PetscScalar)>>>(
+                d_partial_sums, d_pij, d_qij, d_x, d_L, d_U, n);
+            CUDA_CHECK(cudaDeviceSynchronize());
+
+            // 本地归约
+            nb = numBlocks;
+            d_current = d_partial_sums;
+            d_temp = NULL;
+            while (nb > 1) {
+                int newNb = (nb + blockSize * 2 - 1) / (blockSize * 2);
+                CUDA_CHECK(cudaMalloc(&d_temp, newNb * sizeof(PetscScalar)));
+                ReduceSum_Kernel<<<newNb, blockSize, blockSize * sizeof(PetscScalar)>>>(
+                    d_temp, d_current, nb);
+                CUDA_CHECK(cudaDeviceSynchronize());
+                if (d_current != d_partial_sums) cudaFree(d_current);
+                d_current = d_temp;
+                nb = newNb;
+            }
+            PetscScalar res_local;
+            CUDA_CHECK(cudaMemcpy(&res_local, d_current, sizeof(PetscScalar), cudaMemcpyDeviceToHost));
+            if (d_current != d_partial_sums) cudaFree(d_current);
+
+            // MPI归约
+            PetscScalar res_global;
+            MPI_Allreduce(&res_local, &res_global, 1, MPIU_SCALAR, MPI_SUM, PETSC_COMM_WORLD);
+
+            // 计算残差
+            MMA_DualResidual_Scalar_Kernel<<<1, 1>>>(d_err, res_global, d_lam, d_mu, d_a, d_b, d_y, d_z, epsi);
+            CUDA_CHECK(cudaMemcpy(&err, d_err, sizeof(PetscScalar), cudaMemcpyDeviceToHost));
+        }
+
+        epsi = epsi * 0.1;
+    }
+
+    cudaFree(d_partial_sums);
+    cudaFree(d_err);
     return 0;
 }
 

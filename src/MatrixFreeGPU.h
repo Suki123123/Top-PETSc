@@ -80,6 +80,14 @@ PetscErrorCode MatrixFreeGPU_ComputeSensitivity(
     PetscScalar penal);
 
 /**
+ * GPU版本的数组求和（归约）
+ */
+PetscErrorCode MatrixFreeGPU_ReduceSum(
+    PetscScalar* result,
+    const PetscScalar* d_array,
+    PetscInt n);
+
+/**
  * 获取单元数量
  */
 PetscInt MatrixFreeGPU_GetNel(GPUResources* res);
@@ -218,6 +226,153 @@ PetscErrorCode VecGPU_PointwiseMultiply(
     const PetscScalar* d_x,
     const PetscScalar* d_z,
     PetscInt n);
+
+// ============================================================================
+// MMA优化器相关GPU函数
+// ============================================================================
+
+/**
+ * GPU版本的MMA初始化渐近线
+ */
+PetscErrorCode MMAGPU_InitAsymptotes(
+    PetscScalar* d_L,
+    PetscScalar* d_U,
+    const PetscScalar* d_x,
+    const PetscScalar* d_xmin,
+    const PetscScalar* d_xmax,
+    PetscInt n,
+    PetscScalar asyminit);
+
+/**
+ * GPU版本的MMA更新渐近线
+ */
+PetscErrorCode MMAGPU_UpdateAsymptotes(
+    PetscScalar* d_L,
+    PetscScalar* d_U,
+    const PetscScalar* d_x,
+    const PetscScalar* d_xo1,
+    const PetscScalar* d_xo2,
+    const PetscScalar* d_xmin,
+    const PetscScalar* d_xmax,
+    PetscInt n,
+    PetscScalar asymdec,
+    PetscScalar asyminc);
+
+/**
+ * GPU版本的MMA计算alpha, beta, p0, q0
+ */
+PetscErrorCode MMAGPU_ComputeAlphaBetaPQ(
+    PetscScalar* d_alpha,
+    PetscScalar* d_beta,
+    PetscScalar* d_p0,
+    PetscScalar* d_q0,
+    const PetscScalar* d_x,
+    const PetscScalar* d_L,
+    const PetscScalar* d_U,
+    const PetscScalar* d_xmin,
+    const PetscScalar* d_xmax,
+    const PetscScalar* d_dfdx,
+    PetscInt n);
+
+/**
+ * GPU版本的MMA计算pij和qij
+ */
+PetscErrorCode MMAGPU_ComputePijQij(
+    PetscScalar* d_pij,
+    PetscScalar* d_qij,
+    const PetscScalar* d_x,
+    const PetscScalar* d_L,
+    const PetscScalar* d_U,
+    const PetscScalar* d_dgdx,
+    PetscInt n);
+
+/**
+ * GPU版本的MMA计算b
+ */
+PetscErrorCode MMAGPU_ComputeB(
+    PetscScalar* result,
+    const PetscScalar* d_pij,
+    const PetscScalar* d_qij,
+    const PetscScalar* d_x,
+    const PetscScalar* d_L,
+    const PetscScalar* d_U,
+    PetscInt n);
+
+/**
+ * GPU版本的MMA XYZofLAMBDA
+ */
+PetscErrorCode MMAGPU_XYZofLAMBDA(
+    PetscScalar* d_x,
+    const PetscScalar* d_p0,
+    const PetscScalar* d_q0,
+    const PetscScalar* d_pij,
+    const PetscScalar* d_qij,
+    const PetscScalar* d_alpha,
+    const PetscScalar* d_beta,
+    const PetscScalar* d_L,
+    const PetscScalar* d_U,
+    PetscInt n,
+    PetscScalar lam);
+
+/**
+ * GPU版本的MMA DualGrad
+ */
+PetscErrorCode MMAGPU_DualGrad(
+    PetscScalar* result,
+    const PetscScalar* d_pij,
+    const PetscScalar* d_qij,
+    const PetscScalar* d_x,
+    const PetscScalar* d_L,
+    const PetscScalar* d_U,
+    PetscInt n);
+
+/**
+ * GPU版本的MMA DualHess（单约束情况）
+ */
+PetscErrorCode MMAGPU_DualHess(
+    PetscScalar* result,
+    PetscScalar* d_df2,
+    PetscScalar* d_PQ,
+    const PetscScalar* d_x,
+    const PetscScalar* d_p0,
+    const PetscScalar* d_q0,
+    const PetscScalar* d_pij,
+    const PetscScalar* d_qij,
+    const PetscScalar* d_alpha,
+    const PetscScalar* d_beta,
+    const PetscScalar* d_L,
+    const PetscScalar* d_U,
+    PetscInt n,
+    PetscScalar lam);
+
+/**
+ * GPU版本的完整SolveDIP（单约束m=1情况）
+ * 完全在GPU上执行，避免CPU-GPU通信
+ */
+PetscErrorCode MMAGPU_SolveDIP(
+    PetscScalar* d_x,
+    PetscScalar* d_lam,
+    PetscScalar* d_mu,
+    PetscScalar* d_y,
+    PetscScalar* d_z,
+    PetscScalar* d_grad,
+    PetscScalar* d_Hess,
+    PetscScalar* d_s,
+    PetscScalar* d_a,
+    PetscScalar* d_b,
+    PetscScalar* d_c,
+    const PetscScalar* d_p0,
+    const PetscScalar* d_q0,
+    const PetscScalar* d_pij,
+    const PetscScalar* d_qij,
+    const PetscScalar* d_alpha,
+    const PetscScalar* d_beta,
+    const PetscScalar* d_L,
+    const PetscScalar* d_U,
+    PetscScalar* d_df2,
+    PetscScalar* d_PQ,
+    PetscInt n,
+    PetscInt m);
 
 #ifdef __cplusplus
 }

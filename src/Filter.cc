@@ -1,4 +1,18 @@
 #include "Filter.h"
+#include "MatrixFreeGPU.h"
+#include <petscvec.h>
+
+// 检查向量是否是CUDA类型
+static PetscBool IsCudaVec(Vec v) {
+    VecType vec_type;
+    VecGetType(v, &vec_type);
+    if (vec_type && (strcmp(vec_type, VECCUDA) == 0 ||
+                     strcmp(vec_type, VECMPICUDA) == 0 ||
+                     strcmp(vec_type, VECSEQCUDA) == 0)) {
+        return PETSC_TRUE;
+    }
+    return PETSC_FALSE;
+}
 
 /* -----------------------------------------------------------------------------
 Authors: Niels Aage, Erik Andreassen, Boyan Lazarov, August 2013
@@ -73,32 +87,43 @@ PetscErrorCode Filter::FilterProject(Vec x, Vec xTilde, Vec xPhys, PetscBool pro
     else if (filterType == 2) {
         ierr = pdef->FilterProject(x, xTilde);
         CHKERRQ(ierr);
-        // Check for bound violation: simple, but cheap check!
-        PetscScalar* xp;
-        PetscInt     locsiz;
-        VecGetArray(xTilde, &xp);
+
+        // Check for bound violation and fix
+        PetscInt locsiz;
         VecGetLocalSize(xTilde, &locsiz);
-        for (PetscInt i = 0; i < locsiz; i++) {
-            if (xp[i] < 0.0) {
-                if (PetscAbsReal(xp[i]) > 1.0e-4) {
-                    PetscPrintf(PETSC_COMM_WORLD,
-                                "BOUND VIOLATION IN PDEFILTER - INCREASE RMIN OR MESH "
-                                "RESOLUTION: xPhys = %f\n",
-                                xp[i]);
+
+        if (IsCudaVec(xTilde)) {
+            // GPU路径：使用GPU内核进行边界检查
+            PetscScalar* d_x;
+            ierr = VecCUDAGetArray(xTilde, &d_x); CHKERRQ(ierr);
+            ierr = FilterGPU_BoundCheck(d_x, locsiz); CHKERRQ(ierr);
+            ierr = VecCUDARestoreArray(xTilde, &d_x); CHKERRQ(ierr);
+        } else {
+            // CPU路径
+            PetscScalar* xp;
+            VecGetArray(xTilde, &xp);
+            for (PetscInt i = 0; i < locsiz; i++) {
+                if (xp[i] < 0.0) {
+                    if (PetscAbsReal(xp[i]) > 1.0e-4) {
+                        PetscPrintf(PETSC_COMM_WORLD,
+                                    "BOUND VIOLATION IN PDEFILTER - INCREASE RMIN OR MESH "
+                                    "RESOLUTION: xPhys = %f\n",
+                                    xp[i]);
+                    }
+                    xp[i] = 0.0;
                 }
-                xp[i] = 0.0;
-            }
-            if (xp[i] > 1.0) {
-                if (PetscAbsReal(xp[i] - 1.0) > 1.0e-4) {
-                    PetscPrintf(PETSC_COMM_WORLD,
-                                "BOUND VIOLATION IN PDEFILTER - INCREASE RMIN OR MESH "
-                                "RESOLUTION: xPhys = %f\n",
-                                xp[i]);
+                if (xp[i] > 1.0) {
+                    if (PetscAbsReal(xp[i] - 1.0) > 1.0e-4) {
+                        PetscPrintf(PETSC_COMM_WORLD,
+                                    "BOUND VIOLATION IN PDEFILTER - INCREASE RMIN OR MESH "
+                                    "RESOLUTION: xPhys = %f\n",
+                                    xp[i]);
+                    }
+                    xp[i] = 1.0;
                 }
-                xp[i] = 1.0;
             }
+            VecRestoreArray(xTilde, &xp);
         }
-        VecRestoreArray(xTilde, &xp);
     }
     // COPY IN CASE OF SENSITIVITY FILTER
     else {
@@ -127,40 +152,55 @@ PetscErrorCode Filter::Gradients(Vec x, Vec xTilde, Vec dfdx, PetscInt m, Vec* d
         // Get correction
         ChainruleHeavisideFilter(dx, xTilde, beta, eta);
 
-        PetscScalar *xt, *dg, *df, *dxp;
-        PetscInt     locsiz;
+        PetscInt locsiz;
+        ierr = VecGetLocalSize(xTilde, &locsiz); CHKERRQ(ierr);
 
-        ierr = VecGetLocalSize(xTilde, &locsiz);
-        CHKERRQ(ierr);
-        ierr = VecGetArray(xTilde, &xt);
-        CHKERRQ(ierr);
-        ierr = VecGetArray(dx, &dxp);
-        CHKERRQ(ierr);
-        // Objective function
-        ierr = VecGetArray(dfdx, &df);
-        CHKERRQ(ierr);
-        for (PetscInt j = 0; j < locsiz; j++) {
-            df[j] = df[j] * dxp[j];
-        }
-        ierr = VecRestoreArray(dfdx, &df);
-        CHKERRQ(ierr);
-        // Run through all constraints
-        for (PetscInt i = 0; i < m; i++) {
-            ierr = VecGetArray(dgdx[i], &dg);
-            CHKERRQ(ierr);
-            // The eta item corresponding to the correct realization
-            for (PetscInt j = 0; j < locsiz; j++) {
-                dg[j] = dg[j] * dxp[j];
+        // 检查是否使用GPU
+        if (IsCudaVec(dfdx) && IsCudaVec(dx)) {
+            // GPU路径
+            PetscScalar *d_df;
+            const PetscScalar *d_dx;
+
+            ierr = VecCUDAGetArrayRead(dx, &d_dx); CHKERRQ(ierr);
+
+            // Objective function: dfdx = dfdx * dx
+            ierr = VecCUDAGetArray(dfdx, &d_df); CHKERRQ(ierr);
+            ierr = FilterGPU_ElementwiseMult(d_df, d_dx, locsiz); CHKERRQ(ierr);
+            ierr = VecCUDARestoreArray(dfdx, &d_df); CHKERRQ(ierr);
+
+            // Run through all constraints: dgdx[i] = dgdx[i] * dx
+            for (PetscInt i = 0; i < m; i++) {
+                PetscScalar *d_dg;
+                ierr = VecCUDAGetArray(dgdx[i], &d_dg); CHKERRQ(ierr);
+                ierr = FilterGPU_ElementwiseMult(d_dg, d_dx, locsiz); CHKERRQ(ierr);
+                ierr = VecCUDARestoreArray(dgdx[i], &d_dg); CHKERRQ(ierr);
             }
-            ierr = VecRestoreArray(dgdx[i], &dg);
-            CHKERRQ(ierr);
+
+            ierr = VecCUDARestoreArrayRead(dx, &d_dx); CHKERRQ(ierr);
+        } else {
+            // CPU路径
+            PetscScalar *dg, *df, *dxp;
+
+            ierr = VecGetArray(dx, &dxp); CHKERRQ(ierr);
+
+            // Objective function
+            ierr = VecGetArray(dfdx, &df); CHKERRQ(ierr);
+            for (PetscInt j = 0; j < locsiz; j++) {
+                df[j] = df[j] * dxp[j];
+            }
+            ierr = VecRestoreArray(dfdx, &df); CHKERRQ(ierr);
+
+            // Run through all constraints
+            for (PetscInt i = 0; i < m; i++) {
+                ierr = VecGetArray(dgdx[i], &dg); CHKERRQ(ierr);
+                for (PetscInt j = 0; j < locsiz; j++) {
+                    dg[j] = dg[j] * dxp[j];
+                }
+                ierr = VecRestoreArray(dgdx[i], &dg); CHKERRQ(ierr);
+            }
+
+            ierr = VecRestoreArray(dx, &dxp); CHKERRQ(ierr);
         }
-        ierr = VecRestoreArray(dx, &dxp);
-        CHKERRQ(ierr);
-        ierr = VecRestoreArray(dgdx[0], &dg);
-        CHKERRQ(ierr);
-        ierr = VecRestoreArray(xTilde, &xt);
-        CHKERRQ(ierr);
     }
 
     // Chainrule/Filter for the sensitivities
@@ -206,17 +246,27 @@ PetscErrorCode Filter::Gradients(Vec x, Vec xTilde, Vec dfdx, PetscInt m, Vec* d
 PetscScalar Filter::GetMND(Vec x) {
 
     PetscScalar mnd, mndloc = 0.0;
-
-    PetscScalar* xv;
-    PetscInt     nelloc, nelglob;
+    PetscInt nelloc, nelglob;
     VecGetLocalSize(x, &nelloc);
     VecGetSize(x, &nelglob);
 
-    // Compute power sum
-    VecGetArray(x, &xv);
-    for (PetscInt i = 0; i < nelloc; i++) {
-        mndloc += 4 * xv[i] * (1.0 - xv[i]);
+    // 检查是否使用GPU
+    if (IsCudaVec(x)) {
+        // GPU路径
+        const PetscScalar *d_x;
+        VecCUDAGetArrayRead(x, &d_x);
+        FilterGPU_GetMND(&mndloc, d_x, nelloc);
+        VecCUDARestoreArrayRead(x, &d_x);
+    } else {
+        // CPU路径
+        PetscScalar* xv;
+        VecGetArray(x, &xv);
+        for (PetscInt i = 0; i < nelloc; i++) {
+            mndloc += 4 * xv[i] * (1.0 - xv[i]);
+        }
+        VecRestoreArray(x, &xv);
     }
+
     // Collect from procs
     MPI_Allreduce(&mndloc, &mnd, 1, MPIU_SCALAR, MPI_SUM, PETSC_COMM_WORLD);
     mnd = mnd / ((PetscScalar)nelglob);
@@ -226,42 +276,70 @@ PetscScalar Filter::GetMND(Vec x) {
 
 PetscErrorCode Filter::HeavisideFilter(Vec y, Vec x, PetscReal beta, PetscReal eta) {
     PetscErrorCode ierr;
-
-    PetscScalar *yp, *xp;
-    PetscInt     nelloc;
+    PetscInt nelloc;
     VecGetLocalSize(x, &nelloc);
-    ierr = VecGetArray(x, &xp);
-    CHKERRQ(ierr);
-    ierr = VecGetArray(y, &yp);
-    CHKERRQ(ierr);
 
-    for (PetscInt i = 0; i < nelloc; i++) {
-        yp[i] = SmoothProjection(xp[i], beta, eta);
+    // 检查是否使用GPU
+    if (IsCudaVec(x) && IsCudaVec(y)) {
+        // GPU路径
+        PetscScalar *d_y;
+        const PetscScalar *d_x;
+        ierr = VecCUDAGetArrayRead(x, &d_x); CHKERRQ(ierr);
+        ierr = VecCUDAGetArray(y, &d_y); CHKERRQ(ierr);
+
+        ierr = FilterGPU_HeavisideFilter(d_y, d_x, nelloc, beta, eta); CHKERRQ(ierr);
+
+        ierr = VecCUDARestoreArrayRead(x, &d_x); CHKERRQ(ierr);
+        ierr = VecCUDARestoreArray(y, &d_y); CHKERRQ(ierr);
+    } else {
+        // CPU路径
+        PetscScalar *yp, *xp;
+        ierr = VecGetArray(x, &xp); CHKERRQ(ierr);
+        ierr = VecGetArray(y, &yp); CHKERRQ(ierr);
+
+        for (PetscInt i = 0; i < nelloc; i++) {
+            yp[i] = SmoothProjection(xp[i], beta, eta);
+        }
+
+        ierr = VecRestoreArray(x, &xp); CHKERRQ(ierr);
+        ierr = VecRestoreArray(y, &yp); CHKERRQ(ierr);
     }
-    ierr = VecRestoreArray(x, &xp);
-    CHKERRQ(ierr);
-    ierr = VecRestoreArray(y, &yp);
-    CHKERRQ(ierr);
+
+    return 0;
 }
 
 PetscErrorCode Filter::ChainruleHeavisideFilter(Vec y, Vec x, PetscReal beta, PetscReal eta) {
     PetscErrorCode ierr;
-
-    PetscScalar *yp, *xp;
-    PetscInt     nelloc;
+    PetscInt nelloc;
     VecGetLocalSize(x, &nelloc);
-    ierr = VecGetArray(x, &xp);
-    CHKERRQ(ierr);
-    ierr = VecGetArray(y, &yp);
-    CHKERRQ(ierr);
 
-    for (PetscInt i = 0; i < nelloc; i++) {
-        yp[i] = ChainruleSmoothProjection(xp[i], beta, eta);
+    // 检查是否使用GPU
+    if (IsCudaVec(x) && IsCudaVec(y)) {
+        // GPU路径
+        PetscScalar *d_y;
+        const PetscScalar *d_x;
+        ierr = VecCUDAGetArrayRead(x, &d_x); CHKERRQ(ierr);
+        ierr = VecCUDAGetArray(y, &d_y); CHKERRQ(ierr);
+
+        ierr = FilterGPU_ChainruleHeavisideFilter(d_y, d_x, nelloc, beta, eta); CHKERRQ(ierr);
+
+        ierr = VecCUDARestoreArrayRead(x, &d_x); CHKERRQ(ierr);
+        ierr = VecCUDARestoreArray(y, &d_y); CHKERRQ(ierr);
+    } else {
+        // CPU路径
+        PetscScalar *yp, *xp;
+        ierr = VecGetArray(x, &xp); CHKERRQ(ierr);
+        ierr = VecGetArray(y, &yp); CHKERRQ(ierr);
+
+        for (PetscInt i = 0; i < nelloc; i++) {
+            yp[i] = ChainruleSmoothProjection(xp[i], beta, eta);
+        }
+
+        ierr = VecRestoreArray(x, &xp); CHKERRQ(ierr);
+        ierr = VecRestoreArray(y, &yp); CHKERRQ(ierr);
     }
-    ierr = VecRestoreArray(x, &xp);
-    CHKERRQ(ierr);
-    ierr = VecRestoreArray(y, &yp);
-    CHKERRQ(ierr);
+
+    return 0;
 }
 
 // Continuation function

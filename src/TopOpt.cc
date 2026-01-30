@@ -118,7 +118,7 @@ PetscErrorCode TopOpt::SetUp() {
     // SET DEFAULTS for optimization problems
     volfrac = 0.12;
     maxItr  = 400;
-    rmin    = 0.08;
+    rmin    = -1.0;  // -1表示自动计算（1.5倍单元尺寸）
     penal   = 3.0;
     Emin    = 1.0e-9;
     Emax    = 1.0;
@@ -136,6 +136,12 @@ PetscErrorCode TopOpt::SetUp() {
 
     ierr = SetUpMESH();
     CHKERRQ(ierr);
+
+    // 自适应计算rmin（如果未指定）
+    // rmin = 1.5 * dx，保证滤波半径约为1.5个单元
+    if (rmin < 0) {
+        rmin = 1.5 * dx;
+    }
 
     ierr = SetUpOPT();
     CHKERRQ(ierr);
@@ -339,7 +345,7 @@ PetscErrorCode TopOpt::SetUpOPT() {
     PetscPrintf(PETSC_COMM_WORLD, "################### Optimization settings ####################\n");
     PetscPrintf(PETSC_COMM_WORLD, "# Problem size: n= %i, m= %i\n", n, m);
     PetscPrintf(PETSC_COMM_WORLD, "# -filter: %i  (0=sens., 1=dens, 2=PDE)\n", filter);
-    PetscPrintf(PETSC_COMM_WORLD, "# -rmin: %f\n", rmin);
+    PetscPrintf(PETSC_COMM_WORLD, "# -rmin: %f (%.1f elements)\n", rmin, rmin / dx);
     PetscPrintf(PETSC_COMM_WORLD, "# -projectionFilter: %i  (0/1)\n", projectionFilter);
     PetscPrintf(PETSC_COMM_WORLD, "# -beta: %f\n", beta);
     PetscPrintf(PETSC_COMM_WORLD, "# -betaFinal: %f\n", betaFinal);

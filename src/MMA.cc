@@ -1,7 +1,10 @@
 
 #include "MMA.h"
+#include "MatrixFreeGPU.h"
 #include <iostream>
 #include <math.h>
+#include <cstring>
+#include <cuda_runtime.h>
 
 /* -----------------------------------------------------------------------------
 Authors: Niels Aage
@@ -238,6 +241,48 @@ MMA::MMA(PetscInt nn, PetscInt mm, Vec x, PetscScalar* at, PetscScalar* ct, Pets
     s    = new PetscScalar[2 * m];
 
     Hess = new PetscScalar[m * m];
+
+    // Get local size
+    VecGetLocalSize(x, &nloc);
+
+    // Check if using GPU
+    use_gpu = PETSC_FALSE;
+    df2_vec = NULL;
+    PQ_vec = NULL;
+    d_lam = NULL;
+    d_mu = NULL;
+    d_y = NULL;
+    d_z = NULL;
+    d_grad = NULL;
+    d_Hess = NULL;
+    d_s = NULL;
+    d_a = NULL;
+    d_b = NULL;
+    d_c = NULL;
+    VecType vec_type;
+    VecGetType(x, &vec_type);
+    if (vec_type && (strcmp(vec_type, VECCUDA) == 0 ||
+                     strcmp(vec_type, VECMPICUDA) == 0 ||
+                     strcmp(vec_type, VECSEQCUDA) == 0)) {
+        use_gpu = PETSC_TRUE;
+        // Allocate workspace vectors for GPU DualHess
+        VecDuplicate(x, &df2_vec);
+        VecDuplicate(x, &PQ_vec);
+        // Allocate GPU scalar arrays for SolveDIP
+        cudaMalloc(&d_lam, m * sizeof(PetscScalar));
+        cudaMalloc(&d_mu, m * sizeof(PetscScalar));
+        cudaMalloc(&d_y, m * sizeof(PetscScalar));
+        cudaMalloc(&d_z, sizeof(PetscScalar));
+        cudaMalloc(&d_grad, m * sizeof(PetscScalar));
+        cudaMalloc(&d_Hess, m * m * sizeof(PetscScalar));
+        cudaMalloc(&d_s, 2 * m * sizeof(PetscScalar));
+        cudaMalloc(&d_a, m * sizeof(PetscScalar));
+        cudaMalloc(&d_b, m * sizeof(PetscScalar));
+        cudaMalloc(&d_c, m * sizeof(PetscScalar));
+        // Copy a, c to GPU
+        cudaMemcpy(d_a, at, m * sizeof(PetscScalar), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_c, ct, m * sizeof(PetscScalar), cudaMemcpyHostToDevice);
+    }
 }
 
 MMA::MMA(PetscInt nn, PetscInt mm, Vec x) {
@@ -288,6 +333,48 @@ MMA::MMA(PetscInt nn, PetscInt mm, Vec x) {
     s    = new PetscScalar[2 * m];
 
     Hess = new PetscScalar[m * m];
+
+    // Get local size
+    VecGetLocalSize(x, &nloc);
+
+    // Check if using GPU
+    use_gpu = PETSC_FALSE;
+    df2_vec = NULL;
+    PQ_vec = NULL;
+    d_lam = NULL;
+    d_mu = NULL;
+    d_y = NULL;
+    d_z = NULL;
+    d_grad = NULL;
+    d_Hess = NULL;
+    d_s = NULL;
+    d_a = NULL;
+    d_b = NULL;
+    d_c = NULL;
+    VecType vec_type;
+    VecGetType(x, &vec_type);
+    if (vec_type && (strcmp(vec_type, VECCUDA) == 0 ||
+                     strcmp(vec_type, VECMPICUDA) == 0 ||
+                     strcmp(vec_type, VECSEQCUDA) == 0)) {
+        use_gpu = PETSC_TRUE;
+        // Allocate workspace vectors for GPU DualHess
+        VecDuplicate(x, &df2_vec);
+        VecDuplicate(x, &PQ_vec);
+        // Allocate GPU scalar arrays for SolveDIP
+        cudaMalloc(&d_lam, m * sizeof(PetscScalar));
+        cudaMalloc(&d_mu, m * sizeof(PetscScalar));
+        cudaMalloc(&d_y, m * sizeof(PetscScalar));
+        cudaMalloc(&d_z, sizeof(PetscScalar));
+        cudaMalloc(&d_grad, m * sizeof(PetscScalar));
+        cudaMalloc(&d_Hess, m * m * sizeof(PetscScalar));
+        cudaMalloc(&d_s, 2 * m * sizeof(PetscScalar));
+        cudaMalloc(&d_a, m * sizeof(PetscScalar));
+        cudaMalloc(&d_b, m * sizeof(PetscScalar));
+        cudaMalloc(&d_c, m * sizeof(PetscScalar));
+        // Copy a, c to GPU
+        cudaMemcpy(d_a, a, m * sizeof(PetscScalar), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_c, c, m * sizeof(PetscScalar), cudaMemcpyHostToDevice);
+    }
 }
 
 MMA::~MMA() {
@@ -312,6 +399,25 @@ MMA::~MMA() {
     delete[] mu;
     delete[] s;
     delete[] Hess;
+
+    // Clean up GPU workspace
+    if (df2_vec != NULL) {
+        VecDestroy(&df2_vec);
+    }
+    if (PQ_vec != NULL) {
+        VecDestroy(&PQ_vec);
+    }
+    // Clean up GPU scalar arrays
+    if (d_lam != NULL) cudaFree(d_lam);
+    if (d_mu != NULL) cudaFree(d_mu);
+    if (d_y != NULL) cudaFree(d_y);
+    if (d_z != NULL) cudaFree(d_z);
+    if (d_grad != NULL) cudaFree(d_grad);
+    if (d_Hess != NULL) cudaFree(d_Hess);
+    if (d_s != NULL) cudaFree(d_s);
+    if (d_a != NULL) cudaFree(d_a);
+    if (d_b != NULL) cudaFree(d_b);
+    if (d_c != NULL) cudaFree(d_c);
 }
 
 // restart method
@@ -388,39 +494,75 @@ PetscErrorCode MMA::SetOuterMovelimit(PetscScalar Xmin, PetscScalar Xmax, PetscS
 
     PetscErrorCode ierr = 0;
 
-    PetscScalar *xv, *xmiv, *xmav;
-    PetscInt     nloc;
-    VecGetLocalSize(x, &nloc);
-    VecGetArray(x, &xv);
-    VecGetArray(xmin, &xmiv);
-    VecGetArray(xmax, &xmav);
-    for (PetscInt i = 0; i < nloc; i++) {
-        xmav[i] = Min(Xmax, xv[i] + movlim);
-        xmiv[i] = Max(Xmin, xv[i] - movlim);
+    if (use_gpu) {
+        // GPU path
+        const PetscScalar* d_x;
+        PetscScalar *d_xmin, *d_xmax;
+
+        ierr = VecCUDAGetArrayRead(x, &d_x); CHKERRQ(ierr);
+        ierr = VecCUDAGetArray(xmin, &d_xmin); CHKERRQ(ierr);
+        ierr = VecCUDAGetArray(xmax, &d_xmax); CHKERRQ(ierr);
+
+        OCGPU_SetOuterMovelimit(d_xmin, d_xmax, d_x, nloc, Xmin, Xmax, movlim);
+
+        ierr = VecCUDARestoreArrayRead(x, &d_x); CHKERRQ(ierr);
+        ierr = VecCUDARestoreArray(xmin, &d_xmin); CHKERRQ(ierr);
+        ierr = VecCUDARestoreArray(xmax, &d_xmax); CHKERRQ(ierr);
+    } else {
+        // CPU path
+        PetscScalar *xv, *xmiv, *xmav;
+        VecGetArray(x, &xv);
+        VecGetArray(xmin, &xmiv);
+        VecGetArray(xmax, &xmav);
+        for (PetscInt i = 0; i < nloc; i++) {
+            xmav[i] = Min(Xmax, xv[i] + movlim);
+            xmiv[i] = Max(Xmin, xv[i] - movlim);
+        }
+        VecRestoreArray(x, &xv);
+        VecRestoreArray(xmin, &xmiv);
+        VecRestoreArray(xmax, &xmav);
     }
-    VecRestoreArray(x, &xv);
-    VecRestoreArray(xmin, &xmiv);
-    VecRestoreArray(xmax, &xmav);
     return ierr;
 }
 
 PetscScalar MMA::DesignChange(Vec x, Vec xold) {
 
-    PetscScalar *xv, *xo;
-    PetscInt     nloc;
-    VecGetLocalSize(x, &nloc);
-    VecGetArray(x, &xv);
-    VecGetArray(xold, &xo);
     PetscScalar ch = 0.0;
-    for (PetscInt i = 0; i < nloc; i++) {
-        ch    = PetscMax(ch, PetscAbsReal(xv[i] - xo[i]));
-        xo[i] = xv[i];
+
+    if (use_gpu) {
+        // GPU path
+        const PetscScalar *d_x, *d_xold;
+        VecCUDAGetArrayRead(x, &d_x);
+        VecCUDAGetArrayRead(xold, &d_xold);
+
+        PetscScalar ch_local;
+        OCGPU_ComputeChange(&ch_local, d_x, d_xold, nloc);
+
+        VecCUDARestoreArrayRead(x, &d_x);
+        VecCUDARestoreArrayRead(xold, &d_xold);
+
+        // MPI reduce
+        PetscScalar tmp;
+        MPI_Allreduce(&ch_local, &tmp, 1, MPIU_SCALAR, MPI_MAX, PETSC_COMM_WORLD);
+        ch = tmp;
+
+        // Update xold
+        VecCopy(x, xold);
+    } else {
+        // CPU path
+        PetscScalar *xv, *xo;
+        VecGetArray(x, &xv);
+        VecGetArray(xold, &xo);
+        for (PetscInt i = 0; i < nloc; i++) {
+            ch    = PetscMax(ch, PetscAbsReal(xv[i] - xo[i]));
+            xo[i] = xv[i];
+        }
+        PetscScalar tmp;
+        MPI_Allreduce(&ch, &tmp, 1, MPIU_SCALAR, MPI_MAX, PETSC_COMM_WORLD);
+        ch = tmp;
+        VecRestoreArray(x, &xv);
+        VecRestoreArray(xold, &xo);
     }
-    PetscScalar tmp;
-    MPI_Allreduce(&ch, &tmp, 1, MPIU_SCALAR, MPI_MAX, PETSC_COMM_WORLD);
-    ch = tmp;
-    VecRestoreArray(x, &xv);
-    VecRestoreArray(xold, &xo);
 
     return (ch);
 }
@@ -522,167 +664,262 @@ PetscErrorCode MMA::Update(Vec xval, Vec dfdx, PetscScalar* gx, Vec* dgdx, Vec x
 PetscErrorCode MMA::GenSub(Vec xval, Vec dfdx, PetscScalar* gx, Vec* dgdx, Vec xmin, Vec xmax) {
     PetscErrorCode ierr = 0;
 
-    PetscScalar gamma, helpvar;
-
     k++;
-    PetscInt nloc;
-    VecGetLocalSize(xval, &nloc);
-    PetscScalar *xv, *Lv, *Uv, *x1v, *x2v, *xminv, *xmaxv;
-    PetscScalar *alf, *bet, *dfdxv, *p0v, *q0v, **dgdxv, **pijv, **qijv;
-    if (k < 3) {
-        VecAXPBYPCZ(L, (PetscScalar)1.0, -asyminit, (PetscScalar)0.0, xval, xmax);
-        VecAXPY(L, asyminit, xmin);
-        VecAXPBYPCZ(U, (PetscScalar)1.0, +asyminit, (PetscScalar)0.0, xval, xmax);
-        VecAXPY(U, -asyminit, xmin);
-    }
-    VecGetArray(xval, &xv);
-    VecGetArray(L, &Lv);
-    VecGetArray(U, &Uv);
-    VecGetArray(xo1, &x1v);
-    VecGetArray(xo2, &x2v);
-    VecGetArray(xmin, &xminv);
-    VecGetArray(xmax, &xmaxv);
 
-    VecGetArray(alpha, &alf);
-    VecGetArray(beta, &bet);
-    VecGetArray(dfdx, &dfdxv);
-    VecGetArray(p0, &p0v);
-    VecGetArray(q0, &q0v);
+    if (use_gpu) {
+        // GPU path
+        PetscScalar *d_x, *d_L, *d_U, *d_xo1, *d_xo2, *d_xmin, *d_xmax;
+        PetscScalar *d_alpha, *d_beta, *d_dfdx, *d_p0, *d_q0;
+        PetscScalar *d_dgdx, *d_pij, *d_qij;
 
-    VecGetArrays(dgdx, m, &dgdxv);
-    VecGetArrays(pij, m, &pijv);
-    VecGetArrays(qij, m, &qijv);
-    if (k > 2) {
-        for (PetscInt i = 0; i < nloc; i++) {
-            helpvar = (xv[i] - x1v[i]) * (x1v[i] - x2v[i]);
-            if (helpvar < 0.0) {
-                gamma = asymdec;
-            } else if (helpvar > 0.0) {
-                gamma = asyminc;
-            } else {
-                gamma = 1.0;
-            }
-            Lv[i] = xv[i] - gamma * (x1v[i] - Lv[i]);
-            Uv[i] = xv[i] + gamma * (Uv[i] - x1v[i]);
-            PetscScalar xmi, xma;
-            xmi = Max(1.0e-5, xmaxv[i] - xminv[i]);
-            if (RobustAsymptotesType == 0) {
+        // Get GPU arrays
+        ierr = VecCUDAGetArray(xval, &d_x); CHKERRQ(ierr);
+        ierr = VecCUDAGetArray(L, &d_L); CHKERRQ(ierr);
+        ierr = VecCUDAGetArray(U, &d_U); CHKERRQ(ierr);
+        ierr = VecCUDAGetArrayRead(xo1, (const PetscScalar**)&d_xo1); CHKERRQ(ierr);
+        ierr = VecCUDAGetArrayRead(xo2, (const PetscScalar**)&d_xo2); CHKERRQ(ierr);
+        ierr = VecCUDAGetArrayRead(xmin, (const PetscScalar**)&d_xmin); CHKERRQ(ierr);
+        ierr = VecCUDAGetArrayRead(xmax, (const PetscScalar**)&d_xmax); CHKERRQ(ierr);
+        ierr = VecCUDAGetArray(alpha, &d_alpha); CHKERRQ(ierr);
+        ierr = VecCUDAGetArray(beta, &d_beta); CHKERRQ(ierr);
+        ierr = VecCUDAGetArrayRead(dfdx, (const PetscScalar**)&d_dfdx); CHKERRQ(ierr);
+        ierr = VecCUDAGetArray(p0, &d_p0); CHKERRQ(ierr);
+        ierr = VecCUDAGetArray(q0, &d_q0); CHKERRQ(ierr);
+        ierr = VecCUDAGetArrayRead(dgdx[0], (const PetscScalar**)&d_dgdx); CHKERRQ(ierr);
+        ierr = VecCUDAGetArray(pij[0], &d_pij); CHKERRQ(ierr);
+        ierr = VecCUDAGetArray(qij[0], &d_qij); CHKERRQ(ierr);
+
+        // Initialize or update asymptotes
+        if (k < 3) {
+            MMAGPU_InitAsymptotes(d_L, d_U, d_x, d_xmin, d_xmax, nloc, asyminit);
+        } else {
+            MMAGPU_UpdateAsymptotes(d_L, d_U, d_x, d_xo1, d_xo2, d_xmin, d_xmax, nloc, asymdec, asyminc);
+        }
+
+        // Compute alpha, beta, p0, q0
+        MMAGPU_ComputeAlphaBetaPQ(d_alpha, d_beta, d_p0, d_q0, d_x, d_L, d_U, d_xmin, d_xmax, d_dfdx, nloc);
+
+        // Compute pij, qij for constraint
+        MMAGPU_ComputePijQij(d_pij, d_qij, d_x, d_L, d_U, d_dgdx, nloc);
+
+        // Compute b (local sum)
+        PetscScalar b_local;
+        MMAGPU_ComputeB(&b_local, d_pij, d_qij, d_x, d_L, d_U, nloc);
+
+        // Restore arrays
+        ierr = VecCUDARestoreArray(xval, &d_x); CHKERRQ(ierr);
+        ierr = VecCUDARestoreArray(L, &d_L); CHKERRQ(ierr);
+        ierr = VecCUDARestoreArray(U, &d_U); CHKERRQ(ierr);
+        ierr = VecCUDARestoreArrayRead(xo1, (const PetscScalar**)&d_xo1); CHKERRQ(ierr);
+        ierr = VecCUDARestoreArrayRead(xo2, (const PetscScalar**)&d_xo2); CHKERRQ(ierr);
+        ierr = VecCUDARestoreArrayRead(xmin, (const PetscScalar**)&d_xmin); CHKERRQ(ierr);
+        ierr = VecCUDARestoreArrayRead(xmax, (const PetscScalar**)&d_xmax); CHKERRQ(ierr);
+        ierr = VecCUDARestoreArray(alpha, &d_alpha); CHKERRQ(ierr);
+        ierr = VecCUDARestoreArray(beta, &d_beta); CHKERRQ(ierr);
+        ierr = VecCUDARestoreArrayRead(dfdx, (const PetscScalar**)&d_dfdx); CHKERRQ(ierr);
+        ierr = VecCUDARestoreArray(p0, &d_p0); CHKERRQ(ierr);
+        ierr = VecCUDARestoreArray(q0, &d_q0); CHKERRQ(ierr);
+        ierr = VecCUDARestoreArrayRead(dgdx[0], (const PetscScalar**)&d_dgdx); CHKERRQ(ierr);
+        ierr = VecCUDARestoreArray(pij[0], &d_pij); CHKERRQ(ierr);
+        ierr = VecCUDARestoreArray(qij[0], &d_qij); CHKERRQ(ierr);
+
+        // MPI reduce for b
+        PetscScalar b_global;
+        MPI_Allreduce(&b_local, &b_global, 1, MPIU_SCALAR, MPI_SUM, PETSC_COMM_WORLD);
+        b[0] = b_global - gx[0];
+
+    } else {
+        // CPU path (original implementation)
+        PetscScalar gamma, helpvar;
+
+        PetscScalar *xv, *Lv, *Uv, *x1v, *x2v, *xminv, *xmaxv;
+        PetscScalar *alf, *bet, *dfdxv, *p0v, *q0v, **dgdxv, **pijv, **qijv;
+        if (k < 3) {
+            VecAXPBYPCZ(L, (PetscScalar)1.0, -asyminit, (PetscScalar)0.0, xval, xmax);
+            VecAXPY(L, asyminit, xmin);
+            VecAXPBYPCZ(U, (PetscScalar)1.0, +asyminit, (PetscScalar)0.0, xval, xmax);
+            VecAXPY(U, -asyminit, xmin);
+        }
+        VecGetArray(xval, &xv);
+        VecGetArray(L, &Lv);
+        VecGetArray(U, &Uv);
+        VecGetArray(xo1, &x1v);
+        VecGetArray(xo2, &x2v);
+        VecGetArray(xmin, &xminv);
+        VecGetArray(xmax, &xmaxv);
+
+        VecGetArray(alpha, &alf);
+        VecGetArray(beta, &bet);
+        VecGetArray(dfdx, &dfdxv);
+        VecGetArray(p0, &p0v);
+        VecGetArray(q0, &q0v);
+
+        VecGetArrays(dgdx, m, &dgdxv);
+        VecGetArrays(pij, m, &pijv);
+        VecGetArrays(qij, m, &qijv);
+        if (k > 2) {
+            for (PetscInt i = 0; i < nloc; i++) {
+                helpvar = (xv[i] - x1v[i]) * (x1v[i] - x2v[i]);
+                if (helpvar < 0.0) {
+                    gamma = asymdec;
+                } else if (helpvar > 0.0) {
+                    gamma = asyminc;
+                } else {
+                    gamma = 1.0;
+                }
+                Lv[i] = xv[i] - gamma * (x1v[i] - Lv[i]);
+                Uv[i] = xv[i] + gamma * (Uv[i] - x1v[i]);
+                PetscScalar xmi;
+                xmi = Max(1.0e-5, xmaxv[i] - xminv[i]);
                 Lv[i] = Max(Lv[i], xv[i] - 10.0 * xmi);
                 Lv[i] = Min(Lv[i], xv[i] - 0.01 * xmi);
                 Uv[i] = Max(Uv[i], xv[i] + 0.01 * xmi);
                 Uv[i] = Min(Uv[i], xv[i] + 10.0 * xmi);
-            } else if (RobustAsymptotesType == 1) {
-                Lv[i] = Max(Lv[i], xv[i] - 100.0 * xmi);
-                Lv[i] = Min(Lv[i], xv[i] - 1.0e-4 * xmi);
-                Uv[i] = Max(Uv[i], xv[i] + 1.0e-4 * xmi);
-                Uv[i] = Min(Uv[i], xv[i] + 100.0 * xmi);
-                xmi   = xminv[i] - 1.0e-5;
-                xma   = xmaxv[i] + 1.0e-5;
-                if (xv[i] < xmi) {
-                    Lv[i] = xv[i] - (xma - xv[i]) / 0.9;
-                    Uv[i] = xv[i] + (xma - xv[i]) / 0.9;
-                }
-                if (xv[i] > xma) {
-                    Lv[i] = xv[i] - (xv[i] - xmi) / 0.9;
-                    Uv[i] = xv[i] + (xv[i] - xmi) / 0.9;
-                }
             }
         }
-    }
-    PetscScalar dfdxp, dfdxm;
-    PetscScalar feps = 1.0e-6;
-    for (PetscInt i = 0; i < nloc; i++) {
-        alf[i] = Max(xminv[i], 0.9 * Lv[i] + 0.1 * xv[i]);
-        bet[i] = Min(xmaxv[i], 0.9 * Uv[i] + 0.1 * xv[i]);
-        dfdxp  = Max(0.0, dfdxv[i]);
-        dfdxm  = Max(0.0, -1.0 * dfdxv[i]);
-        p0v[i] = pow(Uv[i] - xv[i], 2.0) * (dfdxp + 0.001 * Abs(dfdxv[i]) + 0.5 * feps / (Uv[i] - Lv[i]));
-        q0v[i] = pow(xv[i] - Lv[i], 2.0) * (dfdxm + 0.001 * Abs(dfdxv[i]) + 0.5 * feps / (Uv[i] - Lv[i]));
-        for (PetscInt j = 0; j < m; j++) {
-            dfdxp = Max(0.0, dgdxv[j][i]);
-            dfdxm = Max(0.0, -1.0 * dgdxv[j][i]);
-            if (constraintModification) {
-                pijv[j][i] =
-                    pow(Uv[i] - xv[i], 2.0) * (dfdxp + 0.001 * Abs(dgdxv[j][i]) + 0.5 * feps / (Uv[i] - Lv[i]));
-                qijv[j][i] =
-                    pow(xv[i] - Lv[i], 2.0) * (dfdxm + 0.001 * Abs(dgdxv[j][i]) + 0.5 * feps / (Uv[i] - Lv[i]));
-            } else {
+        PetscScalar dfdxp, dfdxm;
+        PetscScalar feps = 1.0e-6;
+        for (PetscInt i = 0; i < nloc; i++) {
+            alf[i] = Max(xminv[i], 0.9 * Lv[i] + 0.1 * xv[i]);
+            bet[i] = Min(xmaxv[i], 0.9 * Uv[i] + 0.1 * xv[i]);
+            dfdxp  = Max(0.0, dfdxv[i]);
+            dfdxm  = Max(0.0, -1.0 * dfdxv[i]);
+            p0v[i] = pow(Uv[i] - xv[i], 2.0) * (dfdxp + 0.001 * Abs(dfdxv[i]) + 0.5 * feps / (Uv[i] - Lv[i]));
+            q0v[i] = pow(xv[i] - Lv[i], 2.0) * (dfdxm + 0.001 * Abs(dfdxv[i]) + 0.5 * feps / (Uv[i] - Lv[i]));
+            for (PetscInt j = 0; j < m; j++) {
+                dfdxp = Max(0.0, dgdxv[j][i]);
+                dfdxm = Max(0.0, -1.0 * dgdxv[j][i]);
                 pijv[j][i] = pow(Uv[i] - xv[i], 2.0) * (dfdxp);
                 qijv[j][i] = pow(xv[i] - Lv[i], 2.0) * (dfdxm);
             }
         }
-    }
-    for (PetscInt j = 0; j < m; j++) {
-        b[j] = 0.0;
-        for (PetscInt i = 0; i < nloc; i++) {
-            b[j] += pijv[j][i] / (Uv[i] - xv[i]) + qijv[j][i] / (xv[i] - Lv[i]);
+        for (PetscInt j = 0; j < m; j++) {
+            b[j] = 0.0;
+            for (PetscInt i = 0; i < nloc; i++) {
+                b[j] += pijv[j][i] / (Uv[i] - xv[i]) + qijv[j][i] / (xv[i] - Lv[i]);
+            }
         }
-    }
-    {
-        PetscScalar* tmp = new PetscScalar[m];
-        for (PetscInt i = 0; i < m; i++) {
-            tmp[i] = 0.0;
+        {
+            PetscScalar* tmp = new PetscScalar[m];
+            for (PetscInt i = 0; i < m; i++) {
+                tmp[i] = 0.0;
+            }
+            MPI_Allreduce(b, tmp, m, MPIU_SCALAR, MPI_SUM, PETSC_COMM_WORLD);
+            memcpy(b, tmp, sizeof(PetscScalar) * m);
+            delete[] tmp;
         }
-        MPI_Allreduce(b, tmp, m, MPIU_SCALAR, MPI_SUM, PETSC_COMM_WORLD);
-        memcpy(b, tmp, sizeof(PetscScalar) * m);
-        delete[] tmp;
-    }
-    for (PetscInt j = 0; j < m; j++) {
-        b[j] += -gx[j];
-    }
-    VecRestoreArray(xval, &xv);
-    VecRestoreArray(L, &Lv);
-    VecRestoreArray(U, &Uv);
-    VecRestoreArray(xo1, &x1v);
-    VecRestoreArray(xo2, &x2v);
-    VecRestoreArray(xmin, &xminv);
-    VecRestoreArray(xmax, &xmaxv);
+        for (PetscInt j = 0; j < m; j++) {
+            b[j] += -gx[j];
+        }
+        VecRestoreArray(xval, &xv);
+        VecRestoreArray(L, &Lv);
+        VecRestoreArray(U, &Uv);
+        VecRestoreArray(xo1, &x1v);
+        VecRestoreArray(xo2, &x2v);
+        VecRestoreArray(xmin, &xminv);
+        VecRestoreArray(xmax, &xmaxv);
 
-    VecRestoreArray(alpha, &alf);
-    VecRestoreArray(beta, &bet);
-    VecRestoreArray(dfdx, &dfdxv);
+        VecRestoreArray(alpha, &alf);
+        VecRestoreArray(beta, &bet);
+        VecRestoreArray(dfdx, &dfdxv);
 
-    VecRestoreArrays(dgdx, m, &dgdxv);
-    VecRestoreArrays(pij, m, &pijv);
-    VecRestoreArrays(qij, m, &qijv);
+        VecRestoreArrays(dgdx, m, &dgdxv);
+        VecRestoreArrays(pij, m, &pijv);
+        VecRestoreArrays(qij, m, &qijv);
+    }
     return ierr;
 }
 
 PetscErrorCode MMA::SolveDIP(Vec x) {
     PetscErrorCode ierr = 0;
 
+    // 初始化lam和mu
     for (PetscInt j = 0; j < m; j++) {
         lam[j] = c[j] / 2.0;
         mu[j]  = 1.0;
     }
-    PetscScalar tol  = 1.0e-9 * sqrt(m + n);
-    PetscScalar epsi = 1.0;
-    PetscScalar err  = 1.0;
-    PetscInt    loop;
-    while (epsi > tol) {
 
-        loop = 0;
-        while (err > 0.9 * epsi && loop < 100) {
-            loop++;
-            XYZofLAMBDA(x);
-            DualGrad(x);
-            for (PetscInt j = 0; j < m; j++) {
-                grad[j] = -1.0 * grad[j] - epsi / lam[j];
+    if (use_gpu && m == 1) {
+        // GPU路径：完全在GPU上执行（仅支持m=1）
+        // 复制初始值到GPU
+        cudaMemcpy(d_lam, lam, m * sizeof(PetscScalar), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_mu, mu, m * sizeof(PetscScalar), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_b, b, m * sizeof(PetscScalar), cudaMemcpyHostToDevice);
+
+        // 获取GPU指针
+        PetscScalar *d_x, *d_p0_ptr, *d_q0_ptr, *d_pij_ptr, *d_qij_ptr;
+        PetscScalar *d_alpha_ptr, *d_beta_ptr, *d_L_ptr, *d_U_ptr;
+        PetscScalar *d_df2_ptr, *d_PQ_ptr;
+
+        ierr = VecCUDAGetArray(x, &d_x); CHKERRQ(ierr);
+        ierr = VecCUDAGetArrayRead(p0, (const PetscScalar**)&d_p0_ptr); CHKERRQ(ierr);
+        ierr = VecCUDAGetArrayRead(q0, (const PetscScalar**)&d_q0_ptr); CHKERRQ(ierr);
+        ierr = VecCUDAGetArrayRead(pij[0], (const PetscScalar**)&d_pij_ptr); CHKERRQ(ierr);
+        ierr = VecCUDAGetArrayRead(qij[0], (const PetscScalar**)&d_qij_ptr); CHKERRQ(ierr);
+        ierr = VecCUDAGetArrayRead(alpha, (const PetscScalar**)&d_alpha_ptr); CHKERRQ(ierr);
+        ierr = VecCUDAGetArrayRead(beta, (const PetscScalar**)&d_beta_ptr); CHKERRQ(ierr);
+        ierr = VecCUDAGetArrayRead(L, (const PetscScalar**)&d_L_ptr); CHKERRQ(ierr);
+        ierr = VecCUDAGetArrayRead(U, (const PetscScalar**)&d_U_ptr); CHKERRQ(ierr);
+        ierr = VecCUDAGetArray(df2_vec, &d_df2_ptr); CHKERRQ(ierr);
+        ierr = VecCUDAGetArray(PQ_vec, &d_PQ_ptr); CHKERRQ(ierr);
+
+        // 调用GPU版本的SolveDIP
+        ierr = MMAGPU_SolveDIP(
+            d_x, d_lam, d_mu, d_y, d_z, d_grad, d_Hess, d_s,
+            d_a, d_b, d_c,
+            d_p0_ptr, d_q0_ptr, d_pij_ptr, d_qij_ptr,
+            d_alpha_ptr, d_beta_ptr, d_L_ptr, d_U_ptr,
+            d_df2_ptr, d_PQ_ptr,
+            nloc, m); CHKERRQ(ierr);
+
+        // 恢复GPU指针
+        ierr = VecCUDARestoreArray(x, &d_x); CHKERRQ(ierr);
+        ierr = VecCUDARestoreArrayRead(p0, (const PetscScalar**)&d_p0_ptr); CHKERRQ(ierr);
+        ierr = VecCUDARestoreArrayRead(q0, (const PetscScalar**)&d_q0_ptr); CHKERRQ(ierr);
+        ierr = VecCUDARestoreArrayRead(pij[0], (const PetscScalar**)&d_pij_ptr); CHKERRQ(ierr);
+        ierr = VecCUDARestoreArrayRead(qij[0], (const PetscScalar**)&d_qij_ptr); CHKERRQ(ierr);
+        ierr = VecCUDARestoreArrayRead(alpha, (const PetscScalar**)&d_alpha_ptr); CHKERRQ(ierr);
+        ierr = VecCUDARestoreArrayRead(beta, (const PetscScalar**)&d_beta_ptr); CHKERRQ(ierr);
+        ierr = VecCUDARestoreArrayRead(L, (const PetscScalar**)&d_L_ptr); CHKERRQ(ierr);
+        ierr = VecCUDARestoreArrayRead(U, (const PetscScalar**)&d_U_ptr); CHKERRQ(ierr);
+        ierr = VecCUDARestoreArray(df2_vec, &d_df2_ptr); CHKERRQ(ierr);
+        ierr = VecCUDARestoreArray(PQ_vec, &d_PQ_ptr); CHKERRQ(ierr);
+
+        // 复制结果回CPU（用于后续可能的CPU操作）
+        cudaMemcpy(lam, d_lam, m * sizeof(PetscScalar), cudaMemcpyDeviceToHost);
+        cudaMemcpy(y, d_y, m * sizeof(PetscScalar), cudaMemcpyDeviceToHost);
+
+    } else {
+        // CPU路径（或m>1的情况）
+        PetscScalar tol  = 1.0e-9 * sqrt(m + n);
+        PetscScalar epsi = 1.0;
+        PetscScalar err  = 1.0;
+        PetscInt    loop;
+        while (epsi > tol) {
+
+            loop = 0;
+            while (err > 0.9 * epsi && loop < 100) {
+                loop++;
+                XYZofLAMBDA(x);
+                DualGrad(x);
+                for (PetscInt j = 0; j < m; j++) {
+                    grad[j] = -1.0 * grad[j] - epsi / lam[j];
+                }
+                DualHess(x);
+                Factorize(Hess, m);
+                Solve(Hess, grad, m);
+                for (PetscInt j = 0; j < m; j++) {
+                    s[j] = grad[j];
+                }
+                for (PetscInt i = 0; i < m; i++) {
+                    s[m + i] = -mu[i] + epsi / lam[i] - s[i] * mu[i] / lam[i];
+                }
+                DualLineSearch();
+                XYZofLAMBDA(x);
+                err = DualResidual(x, epsi);
             }
-            DualHess(x);
-            Factorize(Hess, m);
-            Solve(Hess, grad, m);
-            for (PetscInt j = 0; j < m; j++) {
-                s[j] = grad[j];
-            }
-            for (PetscInt i = 0; i < m; i++) {
-                s[m + i] = -mu[i] + epsi / lam[i] - s[i] * mu[i] / lam[i];
-            }
-            DualLineSearch();
-            XYZofLAMBDA(x);
-            err = DualResidual(x, epsi);
+            epsi = epsi * 0.1;
         }
-        epsi = epsi * 0.1;
     }
     return ierr;
 }
@@ -690,18 +927,7 @@ PetscErrorCode MMA::SolveDIP(Vec x) {
 PetscErrorCode MMA::XYZofLAMBDA(Vec x) {
     PetscErrorCode ierr = 0;
 
-    PetscInt nloc;
-    VecGetLocalSize(x, &nloc);
-    PetscScalar *xv, **pijv, **qijv, *p0v, *q0v, *alf, *bet, *Lv, *Uv;
-    VecGetArray(x, &xv);
-    VecGetArray(p0, &p0v);
-    VecGetArray(q0, &q0v);
-    VecGetArray(alpha, &alf);
-    VecGetArray(beta, &bet);
-    VecGetArrays(pij, m, &pijv);
-    VecGetArrays(qij, m, &qijv);
-    VecGetArray(L, &Lv);
-    VecGetArray(U, &Uv);
+    // Update y and z (small arrays, keep on CPU)
     PetscScalar lamai = 0.0;
     for (PetscInt i = 0; i < m; i++) {
         if (lam[i] < 0.0) {
@@ -711,171 +937,293 @@ PetscErrorCode MMA::XYZofLAMBDA(Vec x) {
         lamai += lam[i] * a[i];
     }
     z = Max(0.0, 10.0 * (lamai - 1.0)); // SINCE a0 = 1.0
-    PetscScalar pjlam, qjlam;
-    for (PetscInt i = 0; i < nloc; i++) {
-        pjlam = p0v[i];
-        qjlam = q0v[i];
-        for (PetscInt j = 0; j < m; j++) {
-            pjlam += pijv[j][i] * lam[j];
-            qjlam += qijv[j][i] * lam[j];
+
+    if (use_gpu) {
+        // GPU path
+        PetscScalar *d_x, *d_p0, *d_q0, *d_pij, *d_qij, *d_alpha, *d_beta, *d_L, *d_U;
+
+        ierr = VecCUDAGetArray(x, &d_x); CHKERRQ(ierr);
+        ierr = VecCUDAGetArrayRead(p0, (const PetscScalar**)&d_p0); CHKERRQ(ierr);
+        ierr = VecCUDAGetArrayRead(q0, (const PetscScalar**)&d_q0); CHKERRQ(ierr);
+        ierr = VecCUDAGetArrayRead(pij[0], (const PetscScalar**)&d_pij); CHKERRQ(ierr);
+        ierr = VecCUDAGetArrayRead(qij[0], (const PetscScalar**)&d_qij); CHKERRQ(ierr);
+        ierr = VecCUDAGetArrayRead(alpha, (const PetscScalar**)&d_alpha); CHKERRQ(ierr);
+        ierr = VecCUDAGetArrayRead(beta, (const PetscScalar**)&d_beta); CHKERRQ(ierr);
+        ierr = VecCUDAGetArrayRead(L, (const PetscScalar**)&d_L); CHKERRQ(ierr);
+        ierr = VecCUDAGetArrayRead(U, (const PetscScalar**)&d_U); CHKERRQ(ierr);
+
+        MMAGPU_XYZofLAMBDA(d_x, d_p0, d_q0, d_pij, d_qij, d_alpha, d_beta, d_L, d_U, nloc, lam[0]);
+
+        ierr = VecCUDARestoreArray(x, &d_x); CHKERRQ(ierr);
+        ierr = VecCUDARestoreArrayRead(p0, (const PetscScalar**)&d_p0); CHKERRQ(ierr);
+        ierr = VecCUDARestoreArrayRead(q0, (const PetscScalar**)&d_q0); CHKERRQ(ierr);
+        ierr = VecCUDARestoreArrayRead(pij[0], (const PetscScalar**)&d_pij); CHKERRQ(ierr);
+        ierr = VecCUDARestoreArrayRead(qij[0], (const PetscScalar**)&d_qij); CHKERRQ(ierr);
+        ierr = VecCUDARestoreArrayRead(alpha, (const PetscScalar**)&d_alpha); CHKERRQ(ierr);
+        ierr = VecCUDARestoreArrayRead(beta, (const PetscScalar**)&d_beta); CHKERRQ(ierr);
+        ierr = VecCUDARestoreArrayRead(L, (const PetscScalar**)&d_L); CHKERRQ(ierr);
+        ierr = VecCUDARestoreArrayRead(U, (const PetscScalar**)&d_U); CHKERRQ(ierr);
+    } else {
+        // CPU path
+        PetscScalar *xv, **pijv, **qijv, *p0v, *q0v, *alf, *bet, *Lv, *Uv;
+        VecGetArray(x, &xv);
+        VecGetArray(p0, &p0v);
+        VecGetArray(q0, &q0v);
+        VecGetArray(alpha, &alf);
+        VecGetArray(beta, &bet);
+        VecGetArrays(pij, m, &pijv);
+        VecGetArrays(qij, m, &qijv);
+        VecGetArray(L, &Lv);
+        VecGetArray(U, &Uv);
+
+        PetscScalar pjlam, qjlam;
+        for (PetscInt i = 0; i < nloc; i++) {
+            pjlam = p0v[i];
+            qjlam = q0v[i];
+            for (PetscInt j = 0; j < m; j++) {
+                pjlam += pijv[j][i] * lam[j];
+                qjlam += qijv[j][i] * lam[j];
+            }
+            xv[i] = (sqrt(pjlam) * Lv[i] + sqrt(qjlam) * Uv[i]) / (sqrt(pjlam) + sqrt(qjlam));
+            if (xv[i] < alf[i]) {
+                xv[i] = alf[i];
+            }
+            if (xv[i] > bet[i]) {
+                xv[i] = bet[i];
+            }
         }
-        xv[i] = (sqrt(pjlam) * Lv[i] + sqrt(qjlam) * Uv[i]) / (sqrt(pjlam) + sqrt(qjlam));
-        if (xv[i] < alf[i]) {
-            xv[i] = alf[i];
-        }
-        if (xv[i] > bet[i]) {
-            xv[i] = bet[i];
-        }
+        VecRestoreArray(x, &xv);
+        VecRestoreArrays(pij, m, &pijv);
+        VecRestoreArrays(qij, m, &qijv);
+        VecRestoreArray(p0, &p0v);
+        VecRestoreArray(q0, &q0v);
+        VecRestoreArray(alpha, &alf);
+        VecRestoreArray(beta, &bet);
+        VecRestoreArray(L, &Lv);
+        VecRestoreArray(U, &Uv);
     }
-    VecRestoreArray(x, &xv);
-    VecRestoreArrays(pij, m, &pijv);
-    VecRestoreArrays(qij, m, &qijv);
-    VecRestoreArray(p0, &p0v);
-    VecRestoreArray(q0, &q0v);
-    VecRestoreArray(alpha, &alf);
-    VecRestoreArray(beta, &bet);
-    VecRestoreArray(L, &Lv);
-    VecRestoreArray(U, &Uv);
     return ierr;
 }
 
 PetscErrorCode MMA::DualGrad(Vec x) {
     PetscErrorCode ierr = 0;
 
-    PetscInt nloc;
-    VecGetLocalSize(x, &nloc);
-    PetscScalar *xv, *Lv, *Uv, **pijv, **qijv;
-    VecGetArray(x, &xv);
-    VecGetArrays(pij, m, &pijv);
-    VecGetArrays(qij, m, &qijv);
-    VecGetArray(L, &Lv);
-    VecGetArray(U, &Uv);
-    for (PetscInt j = 0; j < m; j++) {
-        grad[j] = 0.0;
-        for (PetscInt i = 0; i < nloc; i++) {
-            grad[j] += pijv[j][i] / (Uv[i] - xv[i]) + qijv[j][i] / (xv[i] - Lv[i]);
+    if (use_gpu) {
+        // GPU path
+        const PetscScalar *d_x, *d_L, *d_U, *d_pij, *d_qij;
+
+        ierr = VecCUDAGetArrayRead(x, &d_x); CHKERRQ(ierr);
+        ierr = VecCUDAGetArrayRead(pij[0], &d_pij); CHKERRQ(ierr);
+        ierr = VecCUDAGetArrayRead(qij[0], &d_qij); CHKERRQ(ierr);
+        ierr = VecCUDAGetArrayRead(L, &d_L); CHKERRQ(ierr);
+        ierr = VecCUDAGetArrayRead(U, &d_U); CHKERRQ(ierr);
+
+        PetscScalar grad_local;
+        MMAGPU_DualGrad(&grad_local, d_pij, d_qij, d_x, d_L, d_U, nloc);
+
+        ierr = VecCUDARestoreArrayRead(x, &d_x); CHKERRQ(ierr);
+        ierr = VecCUDARestoreArrayRead(pij[0], &d_pij); CHKERRQ(ierr);
+        ierr = VecCUDARestoreArrayRead(qij[0], &d_qij); CHKERRQ(ierr);
+        ierr = VecCUDARestoreArrayRead(L, &d_L); CHKERRQ(ierr);
+        ierr = VecCUDARestoreArrayRead(U, &d_U); CHKERRQ(ierr);
+
+        // MPI reduce
+        PetscScalar grad_global;
+        MPI_Allreduce(&grad_local, &grad_global, 1, MPIU_SCALAR, MPI_SUM, PETSC_COMM_WORLD);
+        grad[0] = grad_global - b[0] - a[0] * z - y[0];
+    } else {
+        // CPU path
+        PetscScalar *xv, *Lv, *Uv, **pijv, **qijv;
+        VecGetArray(x, &xv);
+        VecGetArrays(pij, m, &pijv);
+        VecGetArrays(qij, m, &qijv);
+        VecGetArray(L, &Lv);
+        VecGetArray(U, &Uv);
+        for (PetscInt j = 0; j < m; j++) {
+            grad[j] = 0.0;
+            for (PetscInt i = 0; i < nloc; i++) {
+                grad[j] += pijv[j][i] / (Uv[i] - xv[i]) + qijv[j][i] / (xv[i] - Lv[i]);
+            }
         }
-    }
-    {
-        PetscScalar* tmp = new PetscScalar[m];
-        for (PetscInt i = 0; i < m; i++) {
-            tmp[i] = 0.0;
+        {
+            PetscScalar* tmp = new PetscScalar[m];
+            for (PetscInt i = 0; i < m; i++) {
+                tmp[i] = 0.0;
+            }
+            MPI_Allreduce(grad, tmp, m, MPIU_SCALAR, MPI_SUM, PETSC_COMM_WORLD);
+            memcpy(grad, tmp, sizeof(PetscScalar) * m);
+            delete[] tmp;
         }
-        MPI_Allreduce(grad, tmp, m, MPIU_SCALAR, MPI_SUM, PETSC_COMM_WORLD);
-        memcpy(grad, tmp, sizeof(PetscScalar) * m);
-        delete[] tmp;
+        for (PetscInt j = 0; j < m; j++) {
+            grad[j] += -b[j] - a[j] * z - y[j];
+        }
+        VecRestoreArray(x, &xv);
+        VecRestoreArrays(pij, m, &pijv);
+        VecRestoreArrays(qij, m, &qijv);
+        VecRestoreArray(L, &Lv);
+        VecRestoreArray(U, &Uv);
     }
-    for (PetscInt j = 0; j < m; j++) {
-        grad[j] += -b[j] - a[j] * z - y[j];
-    }
-    VecRestoreArray(x, &xv);
-    VecRestoreArrays(pij, m, &pijv);
-    VecRestoreArrays(qij, m, &qijv);
-    VecRestoreArray(L, &Lv);
-    VecRestoreArray(U, &Uv);
     return ierr;
 }
 
 PetscErrorCode MMA::DualHess(Vec x) {
     PetscErrorCode ierr = 0;
 
-    PetscInt nloc;
-    VecGetLocalSize(x, &nloc);
-    PetscScalar *xv, *Lv, *Uv, **pijv, **qijv, *alf, *bet, *p0v, *q0v;
-    VecGetArray(x, &xv);
-    VecGetArrays(pij, m, &pijv);
-    VecGetArrays(qij, m, &qijv);
-    VecGetArray(L, &Lv);
-    VecGetArray(U, &Uv);
-    VecGetArray(alpha, &alf);
-    VecGetArray(beta, &bet);
-    VecGetArray(p0, &p0v);
-    VecGetArray(q0, &q0v);
-    PetscScalar* df2 = new PetscScalar[nloc];
-    PetscScalar* PQ  = new PetscScalar[nloc * m];
-    PetscScalar  pjlam, qjlam;
-    for (PetscInt i = 0; i < nloc; i++) {
-        pjlam = p0v[i];
-        qjlam = q0v[i];
-        for (PetscInt j = 0; j < m; j++) {
-            pjlam += pijv[j][i] * lam[j];
-            qjlam += qijv[j][i] * lam[j];
-            PQ[i * m + j] = pijv[j][i] / pow(Uv[i] - xv[i], 2.0) - qijv[j][i] / pow(xv[i] - Lv[i], 2.0);
+    if (use_gpu) {
+        // GPU path
+        const PetscScalar *d_x, *d_L, *d_U, *d_p0, *d_q0, *d_pij, *d_qij, *d_alpha, *d_beta;
+        PetscScalar *d_df2, *d_PQ;
+
+        ierr = VecCUDAGetArrayRead(x, &d_x); CHKERRQ(ierr);
+        ierr = VecCUDAGetArrayRead(L, &d_L); CHKERRQ(ierr);
+        ierr = VecCUDAGetArrayRead(U, &d_U); CHKERRQ(ierr);
+        ierr = VecCUDAGetArrayRead(p0, &d_p0); CHKERRQ(ierr);
+        ierr = VecCUDAGetArrayRead(q0, &d_q0); CHKERRQ(ierr);
+        ierr = VecCUDAGetArrayRead(pij[0], &d_pij); CHKERRQ(ierr);
+        ierr = VecCUDAGetArrayRead(qij[0], &d_qij); CHKERRQ(ierr);
+        ierr = VecCUDAGetArrayRead(alpha, &d_alpha); CHKERRQ(ierr);
+        ierr = VecCUDAGetArrayRead(beta, &d_beta); CHKERRQ(ierr);
+        ierr = VecCUDAGetArray(df2_vec, &d_df2); CHKERRQ(ierr);
+        ierr = VecCUDAGetArray(PQ_vec, &d_PQ); CHKERRQ(ierr);
+
+        PetscScalar hess_local;
+        MMAGPU_DualHess(&hess_local, d_df2, d_PQ, d_x, d_p0, d_q0, d_pij, d_qij, d_alpha, d_beta, d_L, d_U, nloc, lam[0]);
+
+        ierr = VecCUDARestoreArrayRead(x, &d_x); CHKERRQ(ierr);
+        ierr = VecCUDARestoreArrayRead(L, &d_L); CHKERRQ(ierr);
+        ierr = VecCUDARestoreArrayRead(U, &d_U); CHKERRQ(ierr);
+        ierr = VecCUDARestoreArrayRead(p0, &d_p0); CHKERRQ(ierr);
+        ierr = VecCUDARestoreArrayRead(q0, &d_q0); CHKERRQ(ierr);
+        ierr = VecCUDARestoreArrayRead(pij[0], &d_pij); CHKERRQ(ierr);
+        ierr = VecCUDARestoreArrayRead(qij[0], &d_qij); CHKERRQ(ierr);
+        ierr = VecCUDARestoreArrayRead(alpha, &d_alpha); CHKERRQ(ierr);
+        ierr = VecCUDARestoreArrayRead(beta, &d_beta); CHKERRQ(ierr);
+        ierr = VecCUDARestoreArray(df2_vec, &d_df2); CHKERRQ(ierr);
+        ierr = VecCUDARestoreArray(PQ_vec, &d_PQ); CHKERRQ(ierr);
+
+        // MPI reduce
+        PetscScalar hess_global;
+        MPI_Allreduce(&hess_local, &hess_global, 1, MPIU_SCALAR, MPI_SUM, PETSC_COMM_WORLD);
+        Hess[0] = hess_global;
+
+        // Apply corrections (same as CPU)
+        PetscScalar lamai = 0.0;
+        if (lam[0] < 0.0) {
+            lam[0] = 0.0;
         }
-        df2[i]         = -1.0 / (2.0 * pjlam / pow(Uv[i] - xv[i], 3.0) + 2.0 * qjlam / pow(xv[i] - Lv[i], 3.0));
-        PetscScalar xp = (sqrt(pjlam) * Lv[i] + sqrt(qjlam) * Uv[i]) / (sqrt(pjlam) + sqrt(qjlam));
-        if (xp < alf[i]) {
-            df2[i] = 0.0;
+        lamai = lam[0] * a[0];
+        if (lam[0] > c[0]) {
+            Hess[0] += -1.0;
         }
-        if (xp > bet[i]) {
-            df2[i] = 0.0;
+        Hess[0] += -mu[0] / lam[0];
+
+        if (lamai > 0.0) {
+            Hess[0] += -10.0 * a[0] * a[0];
         }
-    }
-    PetscScalar* tmp = new PetscScalar[n * m];
-    for (PetscInt j = 0; j < m; j++) {
+
+        PetscScalar HessCorr = 1e-4 * Hess[0];
+        if (-1.0 * HessCorr < 1.0e-7) {
+            HessCorr = -1.0e-7;
+        }
+        Hess[0] += HessCorr;
+    } else {
+        // CPU path
+        PetscScalar *xv, *Lv, *Uv, **pijv, **qijv, *alf, *bet, *p0v, *q0v;
+        VecGetArray(x, &xv);
+        VecGetArrays(pij, m, &pijv);
+        VecGetArrays(qij, m, &qijv);
+        VecGetArray(L, &Lv);
+        VecGetArray(U, &Uv);
+        VecGetArray(alpha, &alf);
+        VecGetArray(beta, &bet);
+        VecGetArray(p0, &p0v);
+        VecGetArray(q0, &q0v);
+        PetscScalar* df2 = new PetscScalar[nloc];
+        PetscScalar* PQ  = new PetscScalar[nloc * m];
+        PetscScalar  pjlam, qjlam;
         for (PetscInt i = 0; i < nloc; i++) {
-            tmp[j * nloc + i] = 0.0;
-            tmp[j * nloc + i] += PQ[i * m + j] * df2[i];
-        }
-    }
-    for (PetscInt i = 0; i < m; i++) {
-        for (PetscInt j = 0; j < m; j++) {
-            Hess[i * m + j] = 0.0;
-            for (PetscInt k = 0; k < nloc; k++) {
-                Hess[i * m + j] += tmp[i * nloc + k] * PQ[k * m + j];
+            pjlam = p0v[i];
+            qjlam = q0v[i];
+            for (PetscInt j = 0; j < m; j++) {
+                pjlam += pijv[j][i] * lam[j];
+                qjlam += qijv[j][i] * lam[j];
+                PQ[i * m + j] = pijv[j][i] / pow(Uv[i] - xv[i], 2.0) - qijv[j][i] / pow(xv[i] - Lv[i], 2.0);
+            }
+            df2[i]         = -1.0 / (2.0 * pjlam / pow(Uv[i] - xv[i], 3.0) + 2.0 * qjlam / pow(xv[i] - Lv[i], 3.0));
+            PetscScalar xp = (sqrt(pjlam) * Lv[i] + sqrt(qjlam) * Uv[i]) / (sqrt(pjlam) + sqrt(qjlam));
+            if (xp < alf[i]) {
+                df2[i] = 0.0;
+            }
+            if (xp > bet[i]) {
+                df2[i] = 0.0;
             }
         }
-    }
-    {
-        PetscScalar* tmpp = new PetscScalar[m * m];
-        for (PetscInt i = 0; i < m * m; i++) {
-            tmpp[i] = Hess[i];
-        }
-        MPI_Allreduce(Hess, tmpp, m * m, MPIU_SCALAR, MPI_SUM, PETSC_COMM_WORLD);
-        memcpy(Hess, tmpp, sizeof(PetscScalar) * m * m);
-        delete[] tmpp;
-    }
-    PetscScalar lamai = 0.0;
-    for (PetscInt j = 0; j < m; j++) {
-        if (lam[j] < 0.0) {
-            lam[j] = 0.0;
-        }
-        lamai += lam[j] * a[j];
-        if (lam[j] > c[j]) {
-            Hess[j * m + j] += -1.0;
-        }
-        Hess[j * m + j] += -mu[j] / lam[j];
-    }
-    if (lamai > 0.0) {
+        PetscScalar* tmp = new PetscScalar[n * m];
         for (PetscInt j = 0; j < m; j++) {
-            for (PetscInt k = 0; k < m; k++) {
-                Hess[j * m + k] += -10.0 * a[j] * a[k];
+            for (PetscInt i = 0; i < nloc; i++) {
+                tmp[j * nloc + i] = 0.0;
+                tmp[j * nloc + i] += PQ[i * m + j] * df2[i];
             }
         }
+        for (PetscInt i = 0; i < m; i++) {
+            for (PetscInt j = 0; j < m; j++) {
+                Hess[i * m + j] = 0.0;
+                for (PetscInt k = 0; k < nloc; k++) {
+                    Hess[i * m + j] += tmp[i * nloc + k] * PQ[k * m + j];
+                }
+            }
+        }
+        {
+            PetscScalar* tmpp = new PetscScalar[m * m];
+            for (PetscInt i = 0; i < m * m; i++) {
+                tmpp[i] = Hess[i];
+            }
+            MPI_Allreduce(Hess, tmpp, m * m, MPIU_SCALAR, MPI_SUM, PETSC_COMM_WORLD);
+            memcpy(Hess, tmpp, sizeof(PetscScalar) * m * m);
+            delete[] tmpp;
+        }
+        PetscScalar lamai = 0.0;
+        for (PetscInt j = 0; j < m; j++) {
+            if (lam[j] < 0.0) {
+                lam[j] = 0.0;
+            }
+            lamai += lam[j] * a[j];
+            if (lam[j] > c[j]) {
+                Hess[j * m + j] += -1.0;
+            }
+            Hess[j * m + j] += -mu[j] / lam[j];
+        }
+        if (lamai > 0.0) {
+            for (PetscInt j = 0; j < m; j++) {
+                for (PetscInt k = 0; k < m; k++) {
+                    Hess[j * m + k] += -10.0 * a[j] * a[k];
+                }
+            }
+        }
+        PetscScalar HessTrace = 0.0;
+        for (PetscInt i = 0; i < m; i++) {
+            HessTrace += Hess[i * m + i];
+        }
+        PetscScalar HessCorr = 1e-4 * HessTrace / m;
+        if (-1.0 * HessCorr < 1.0e-7) {
+            HessCorr = -1.0e-7;
+        }
+        for (PetscInt i = 0; i < m; i++) {
+            Hess[i * m + i] += HessCorr;
+        }
+        VecRestoreArray(x, &xv);
+        VecRestoreArrays(pij, m, &pijv);
+        VecRestoreArrays(qij, m, &qijv);
+        VecRestoreArray(L, &Lv);
+        VecRestoreArray(U, &Uv);
+        VecRestoreArray(q0, &q0v);
+        VecRestoreArray(p0, &p0v);
+        VecRestoreArray(alpha, &alf);
+        VecRestoreArray(beta, &bet);
+        delete[] df2;
+        delete[] PQ;
+        delete[] tmp;
     }
-    PetscScalar HessTrace = 0.0;
-    for (PetscInt i = 0; i < m; i++) {
-        HessTrace += Hess[i * m + i];
-    }
-    PetscScalar HessCorr = 1e-4 * HessTrace / m;
-    if (-1.0 * HessCorr < 1.0e-7) {
-        HessCorr = -1.0e-7;
-    }
-    for (PetscInt i = 0; i < m; i++) {
-        Hess[i * m + i] += HessCorr;
-    }
-    VecRestoreArray(x, &xv);
-    VecRestoreArrays(pij, m, &pijv);
-    VecRestoreArrays(qij, m, &qijv);
-    VecRestoreArray(L, &Lv);
-    VecRestoreArray(U, &Uv);
-    VecRestoreArray(q0, &q0v);
-    VecRestoreArray(p0, &p0v);
-    VecRestoreArray(alpha, &alf);
-    VecRestoreArray(beta, &bet);
-    delete[] df2;
-    delete[] PQ;
-    delete[] tmp;
     return ierr;
 }
 
@@ -901,47 +1249,77 @@ PetscErrorCode MMA::DualLineSearch() {
 
 PetscScalar MMA::DualResidual(Vec x, PetscScalar epsi) {
 
-    PetscInt nloc;
-    VecGetLocalSize(x, &nloc);
-    PetscScalar* res = new PetscScalar[2 * m];
-    PetscScalar *xv, *Lv, *Uv, **pijv, **qijv;
-    VecGetArray(x, &xv);
-    VecGetArrays(pij, m, &pijv);
-    VecGetArrays(qij, m, &qijv);
-    VecGetArray(L, &Lv);
-    VecGetArray(U, &Uv);
-    for (PetscInt j = 0; j < m; j++) {
-        res[j]     = 0.0;
-        res[j + m] = 0.0;
-        for (PetscInt i = 0; i < nloc; i++) {
-            res[j] += pijv[j][i] / (Uv[i] - xv[i]) + qijv[j][i] / (xv[i] - Lv[i]);
-        }
-    }
-    {
-        PetscScalar* tmp = new PetscScalar[2 * m];
-        for (PetscInt i = 0; i < 2 * m; i++) {
-            tmp[i] = 0.0;
-        }
-        MPI_Allreduce(res, tmp, 2 * m, MPIU_SCALAR, MPI_SUM, PETSC_COMM_WORLD);
-        memcpy(res, tmp, sizeof(PetscScalar) * 2 * m);
-        delete[] tmp;
-    }
-    for (PetscInt j = 0; j < m; j++) {
-        res[j] += -b[j] - a[j] * z - y[j] + mu[j];
-        res[j + m] += mu[j] * lam[j] - epsi;
-    }
     PetscScalar nrI = 0.0;
-    for (PetscInt i = 0; i < 2 * m; i++) {
-        if (nrI < Abs(res[i])) {
-            nrI = Abs(res[i]);
+
+    if (use_gpu) {
+        // GPU path
+        const PetscScalar *d_x, *d_L, *d_U, *d_pij, *d_qij;
+
+        VecCUDAGetArrayRead(x, &d_x);
+        VecCUDAGetArrayRead(pij[0], &d_pij);
+        VecCUDAGetArrayRead(qij[0], &d_qij);
+        VecCUDAGetArrayRead(L, &d_L);
+        VecCUDAGetArrayRead(U, &d_U);
+
+        PetscScalar res_local;
+        MMAGPU_DualGrad(&res_local, d_pij, d_qij, d_x, d_L, d_U, nloc);
+
+        VecCUDARestoreArrayRead(x, &d_x);
+        VecCUDARestoreArrayRead(pij[0], &d_pij);
+        VecCUDARestoreArrayRead(qij[0], &d_qij);
+        VecCUDARestoreArrayRead(L, &d_L);
+        VecCUDARestoreArrayRead(U, &d_U);
+
+        // MPI reduce
+        PetscScalar res_global;
+        MPI_Allreduce(&res_local, &res_global, 1, MPIU_SCALAR, MPI_SUM, PETSC_COMM_WORLD);
+
+        PetscScalar res0 = res_global - b[0] - a[0] * z - y[0] + mu[0];
+        PetscScalar res1 = mu[0] * lam[0] - epsi;
+
+        nrI = Abs(res0);
+        if (Abs(res1) > nrI) nrI = Abs(res1);
+    } else {
+        // CPU path
+        PetscScalar* res = new PetscScalar[2 * m];
+        PetscScalar *xv, *Lv, *Uv, **pijv, **qijv;
+        VecGetArray(x, &xv);
+        VecGetArrays(pij, m, &pijv);
+        VecGetArrays(qij, m, &qijv);
+        VecGetArray(L, &Lv);
+        VecGetArray(U, &Uv);
+        for (PetscInt j = 0; j < m; j++) {
+            res[j]     = 0.0;
+            res[j + m] = 0.0;
+            for (PetscInt i = 0; i < nloc; i++) {
+                res[j] += pijv[j][i] / (Uv[i] - xv[i]) + qijv[j][i] / (xv[i] - Lv[i]);
+            }
         }
+        {
+            PetscScalar* tmp = new PetscScalar[2 * m];
+            for (PetscInt i = 0; i < 2 * m; i++) {
+                tmp[i] = 0.0;
+            }
+            MPI_Allreduce(res, tmp, 2 * m, MPIU_SCALAR, MPI_SUM, PETSC_COMM_WORLD);
+            memcpy(res, tmp, sizeof(PetscScalar) * 2 * m);
+            delete[] tmp;
+        }
+        for (PetscInt j = 0; j < m; j++) {
+            res[j] += -b[j] - a[j] * z - y[j] + mu[j];
+            res[j + m] += mu[j] * lam[j] - epsi;
+        }
+        for (PetscInt i = 0; i < 2 * m; i++) {
+            if (nrI < Abs(res[i])) {
+                nrI = Abs(res[i]);
+            }
+        }
+        delete[] res;
+        VecRestoreArray(x, &xv);
+        VecRestoreArrays(pij, m, &pijv);
+        VecRestoreArrays(qij, m, &qijv);
+        VecRestoreArray(L, &Lv);
+        VecRestoreArray(U, &Uv);
     }
-    delete[] res;
-    VecRestoreArray(x, &xv);
-    VecRestoreArrays(pij, m, &pijv);
-    VecRestoreArrays(qij, m, &qijv);
-    VecRestoreArray(L, &Lv);
-    VecRestoreArray(U, &Uv);
     return nrI;
 }
 
