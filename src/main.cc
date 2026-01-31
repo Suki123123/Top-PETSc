@@ -1,5 +1,6 @@
 #include "Filter.h"
 #include "LinearElasticity.h"
+#include "MMA.h"
 #include "OC.h"
 #include "MPIIO.h"
 #include "TopOpt.h"
@@ -23,6 +24,7 @@ static char help[] = "3D拓扑优化 - 使用PCG求解器\n"
                      "  -nx, -ny, -nz       网格尺寸（节点数）\n"
                      "可选参数:\n"
                      "  -maxItr <200>       最大迭代次数（默认200）\n"
+                     "  -use_mma            使用MMA优化器（默认使用OC）\n"
                      "  -output_final_vtk   输出最终VTK文件\n";
 
 // 设置GPU运行环境
@@ -81,14 +83,26 @@ int main(int argc, char* argv[]) {
 
     // STEP 4: VISUALIZATION USING VTK
     MPIIO* output = new MPIIO(opt->da_nodes, 3, "ux, uy, uz", 3, "x, xTilde, xPhys");
-    // STEP 5: 优化器 - 只使用OC
-    PetscPrintf(PETSC_COMM_WORLD, "# 使用OC优化器 (Optimality Criteria)\n");
-    OC* oc = new OC(opt->n, opt->x);
+    
+    // STEP 5: 优化器 - OC或MMA
+    PetscBool use_mma = PETSC_FALSE;
+    PetscBool flg;
+    PetscOptionsGetBool(NULL, NULL, "-use_mma", &use_mma, &flg);
+    
+    MMA* mma = NULL;
+    OC* oc = NULL;
     PetscInt itr = 0;
+    
+    if (use_mma) {
+        PetscPrintf(PETSC_COMM_WORLD, "# 使用MMA优化器 (Method of Moving Asymptotes)\n");
+        opt->AllocateMMAwithRestart(&itr, &mma);
+    } else {
+        PetscPrintf(PETSC_COMM_WORLD, "# 使用OC优化器 (Optimality Criteria)\n");
+        oc = new OC(opt->n, opt->x);
+    }
 
     // VTK输出控制选项
     PetscBool output_final_vtk = PETSC_FALSE;  // 默认不输出VTK
-    PetscBool flg;
     PetscOptionsGetBool(NULL, NULL, "-output_final_vtk", &output_final_vtk, &flg);
 
     // STEP 6: FILTER THE INITIAL DESIGN/RESTARTED DESIGN
@@ -124,14 +138,26 @@ int main(int argc, char* argv[]) {
                                  opt->eta);
         CHKERRQ(ierr);
 
-        // 设置设计变量的外部移动限制
-        ierr = oc->SetOuterMovelimit(opt->Xmin, opt->Xmax, opt->movlim, opt->x, opt->xmin, opt->xmax);
-        CHKERRQ(ierr);
-        // 使用OC更新设计
-        ierr = oc->Update(opt->x, opt->dfdx, opt->gx, opt->dgdx, opt->xmin, opt->xmax);
-        CHKERRQ(ierr);
-        // 计算设计变化的无穷范数
-        ch = oc->DesignChange(opt->x, opt->xold);
+        // 更新设计变量
+        if (use_mma) {
+            // 设置设计变量的外部移动限制
+            ierr = mma->SetOuterMovelimit(opt->Xmin, opt->Xmax, opt->movlim, opt->x, opt->xmin, opt->xmax);
+            CHKERRQ(ierr);
+            // 使用MMA更新设计
+            ierr = mma->Update(opt->x, opt->dfdx, opt->gx, opt->dgdx, opt->xmin, opt->xmax);
+            CHKERRQ(ierr);
+            // 计算设计变化的无穷范数
+            ch = mma->DesignChange(opt->x, opt->xold);
+        } else {
+            // 设置设计变量的外部移动限制
+            ierr = oc->SetOuterMovelimit(opt->Xmin, opt->Xmax, opt->movlim, opt->x, opt->xmin, opt->xmax);
+            CHKERRQ(ierr);
+            // 使用OC更新设计
+            ierr = oc->Update(opt->x, opt->dfdx, opt->gx, opt->dgdx, opt->xmin, opt->xmax);
+            CHKERRQ(ierr);
+            // 计算设计变化的无穷范数
+            ch = oc->DesignChange(opt->x, opt->xold);
+        }
 
         // Increase beta if needed
         PetscBool changeBeta = PETSC_FALSE;
@@ -173,7 +199,12 @@ int main(int argc, char* argv[]) {
     }
 
     // STEP 8: 清理
-    delete oc;
+    if (use_mma && mma != NULL) {
+        delete mma;
+    }
+    if (!use_mma && oc != NULL) {
+        delete oc;
+    }
     delete output;
     delete filter;
     delete opt;

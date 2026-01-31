@@ -86,6 +86,10 @@ class TopOpt {
     Vec  xold;       // x from previous iteration
     Vec* dgdx;       // Sensitivities of constraints (vector array)
 
+    // MMA restart support
+    PetscErrorCode AllocateMMAwithRestart(PetscInt* itr, class MMA** mma);
+    PetscErrorCode WriteRestartFiles(PetscInt* itr, class MMA* mma);
+
   private:
     // Allocate and set default values
     void           Init();

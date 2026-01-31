@@ -1,4 +1,5 @@
 #include "TopOpt.h"
+#include "MMA.h"
 #include <cmath>
 
 /*
@@ -344,4 +345,120 @@ PetscErrorCode TopOpt::SetUpOPT() {
     VecSet(xold, volfrac);
 
     return (ierr);
+}
+
+PetscErrorCode TopOpt::AllocateMMAwithRestart(PetscInt* itr, MMA** mma) {
+    PetscErrorCode ierr = 0;
+
+    // 检查是否存在restart文件
+    std::string filename00 = "Restart00_xPhys.dat";
+    std::string filename01 = "Restart01_xPhys.dat";
+
+    // 如果没有restart文件，从头开始
+    if (!fexists(filename00) || !fexists(filename01)) {
+        PetscPrintf(PETSC_COMM_WORLD, "# 没有找到restart文件，从头开始优化\n");
+        *itr = 0;
+        *mma = new MMA(n, m, x);
+        return ierr;
+    }
+
+    // 读取restart文件
+    PetscPrintf(PETSC_COMM_WORLD, "# 从restart文件恢复优化\n");
+
+    Vec xo1, xo2, U, L;
+    VecDuplicate(x, &xo1);
+    VecDuplicate(x, &xo2);
+    VecDuplicate(x, &U);
+    VecDuplicate(x, &L);
+
+    // 读取xo1 (Restart00)
+    PetscViewer view;
+    ierr = PetscViewerBinaryOpen(PETSC_COMM_WORLD, filename00.c_str(), FILE_MODE_READ, &view);
+    CHKERRQ(ierr);
+    VecLoad(xo1, view);
+    PetscViewerDestroy(&view);
+
+    // 读取xo2 (Restart01)
+    ierr = PetscViewerBinaryOpen(PETSC_COMM_WORLD, filename01.c_str(), FILE_MODE_READ, &view);
+    CHKERRQ(ierr);
+    VecLoad(xo2, view);
+    PetscViewerDestroy(&view);
+
+    // 读取U
+    ierr = PetscViewerBinaryOpen(PETSC_COMM_WORLD, "RestartU.dat", FILE_MODE_READ, &view);
+    CHKERRQ(ierr);
+    VecLoad(U, view);
+    PetscViewerDestroy(&view);
+
+    // 读取L
+    ierr = PetscViewerBinaryOpen(PETSC_COMM_WORLD, "RestartL.dat", FILE_MODE_READ, &view);
+    CHKERRQ(ierr);
+    VecLoad(L, view);
+    PetscViewerDestroy(&view);
+
+    // 设置迭代次数（假设从文件名推断，这里简化为3）
+    *itr = 3;
+
+    // 创建MMA对象
+    *mma = new MMA(n, m, *itr, xo1, xo2, U, L);
+
+    // 清理临时向量
+    VecDestroy(&xo1);
+    VecDestroy(&xo2);
+    VecDestroy(&U);
+    VecDestroy(&L);
+
+    return ierr;
+}
+
+PetscErrorCode TopOpt::WriteRestartFiles(PetscInt* itr, MMA* mma) {
+    PetscErrorCode ierr = 0;
+
+    if (mma == NULL) {
+        return ierr;
+    }
+
+    // 获取restart数据
+    Vec xo1, xo2, U, L;
+    VecDuplicate(x, &xo1);
+    VecDuplicate(x, &xo2);
+    VecDuplicate(x, &U);
+    VecDuplicate(x, &L);
+
+    mma->Restart(xo1, xo2, U, L);
+
+    // 写入文件
+    PetscViewer view;
+    
+    // 写入xo1
+    ierr = PetscViewerBinaryOpen(PETSC_COMM_WORLD, "Restart00_xPhys.dat", FILE_MODE_WRITE, &view);
+    CHKERRQ(ierr);
+    VecView(xo1, view);
+    PetscViewerDestroy(&view);
+
+    // 写入xo2
+    ierr = PetscViewerBinaryOpen(PETSC_COMM_WORLD, "Restart01_xPhys.dat", FILE_MODE_WRITE, &view);
+    CHKERRQ(ierr);
+    VecView(xo2, view);
+    PetscViewerDestroy(&view);
+
+    // 写入U
+    ierr = PetscViewerBinaryOpen(PETSC_COMM_WORLD, "RestartU.dat", FILE_MODE_WRITE, &view);
+    CHKERRQ(ierr);
+    VecView(U, view);
+    PetscViewerDestroy(&view);
+
+    // 写入L
+    ierr = PetscViewerBinaryOpen(PETSC_COMM_WORLD, "RestartL.dat", FILE_MODE_WRITE, &view);
+    CHKERRQ(ierr);
+    VecView(L, view);
+    PetscViewerDestroy(&view);
+
+    // 清理
+    VecDestroy(&xo1);
+    VecDestroy(&xo2);
+    VecDestroy(&U);
+    VecDestroy(&L);
+
+    return ierr;
 }
