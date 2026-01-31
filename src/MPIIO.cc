@@ -180,10 +180,11 @@ PetscErrorCode MPIIO::WriteVTK(DM da_nodes, Vec U, Vec x, Vec xTilde, Vec xPhys,
     CHKERRQ(ierr);
 
     // CELL FIELD(S)
-    PetscScalar *xpp, *xp, *xt;
-    VecGetArray(x, &xp);
-    VecGetArray(xTilde, &xt);
-    VecGetArray(xPhys, &xpp);
+    // Use VecGetArrayRead to ensure GPU->CPU sync for CUDA vectors
+    const PetscScalar *xpp, *xp, *xt;
+    VecGetArrayRead(x, &xp);
+    VecGetArrayRead(xTilde, &xt);
+    VecGetArrayRead(xPhys, &xpp);
 
     for (unsigned long int i = 0; i < nCellsMyrank[0]; i++) {
         // Density
@@ -193,9 +194,9 @@ PetscErrorCode MPIIO::WriteVTK(DM da_nodes, Vec U, Vec x, Vec xTilde, Vec xPhys,
     }
     writeCellFields(0, workCellField);
     // Restore arrays
-    VecRestoreArray(x, &xp);
-    VecRestoreArray(xTilde, &xt);
-    VecRestoreArray(xPhys, &xpp);
+    VecRestoreArrayRead(x, &xp);
+    VecRestoreArrayRead(xTilde, &xt);
+    VecRestoreArrayRead(xPhys, &xpp);
 
     // clean up
     ierr = VecDestroy(&Ulocal);

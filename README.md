@@ -1,86 +1,139 @@
-# TopOpt GPU加速项目
+# 3D Topology Optimization with GPU Acceleration
 
-PETSc拓扑优化程序的GPU加速实现，支持单GPU和双GPU并行计算。
+基于PETSc的3D拓扑优化程序，支持GPU加速和多GPU并行计算。
 
-## 快速开始
+## 特性
 
-### 单GPU运行
+- **GPU加速**: 使用CUDA加速矩阵运算和求解器
+- **多GPU支持**: 支持单GPU和双GPU并行计算
+- **Matrix-Free**: 无矩阵模式，节省内存
+- **PCG求解器**: 预条件共轭梯度法 (CG + Jacobi)
+- **OC优化器**: Optimality Criteria优化算法
+- **PDE滤波器**: 基于PDE的密度滤波
+- **简化参数**: 固定常用参数，简化使用
+
+## 固定配置
+
+程序已将常用参数固定在代码中：
+
+- **体积分数**: 0.12 (12%)
+- **惩罚因子**: 3.0 (SIMP)
+- **滤波器**: PDE滤波器，rmin自动计算（1.5倍单元尺寸）
+- **求解器**: PCG (CG + Jacobi)
+- **KSP最大迭代**: 1000
+- **收敛标准**: ch < 0.02
+- **输出频率**: 每10次迭代输出一次
+
+## 系统要求
+
+- **操作系统**: Linux
+- **编译器**: GCC/G++ with CUDA support
+- **依赖库**:
+  - PETSc 3.21.0 (with CUDA support)
+  - CUDA 12.2+
+  - OpenMPI (with CUDA-aware support)
+  - Python 3 (用于VTK转换)
+
+## 编译
+
 ```bash
-TopOpt_in_PETSc/topopt \
-    -options_file options_gpu_balanced.txt \
-    -nx 65 -ny 33 -nz 33 -nlvls 4 -maxItr 100
+cd src
+make
 ```
 
-### 双GPU运行
-```bash
-# 设置环境变量
-export OPENMPI_CUDA_HOME=$HOME/openmpi-cuda
-export PATH=$OPENMPI_CUDA_HOME/bin:$PATH
-export LD_LIBRARY_PATH=$OPENMPI_CUDA_HOME/lib:$LD_LIBRARY_PATH
+## 使用方法
 
-# 运行
-mpirun -np 2 TopOpt_in_PETSc/topopt \
-    -options_file options_dual_gpu_production.txt \
-    -nx 65 -ny 65 -nz 33 -nlvls 4 -maxItr 100
+### 基本用法
+
+```bash
+# 单GPU
+./src/topopt -nx 65 -ny 33 -nz 33
+
+# 双GPU
+mpirun -np 2 ./src/topopt -nx 65 -ny 33 -nz 33
 ```
+
+### 可选参数
+
+- `-nx <数值>`: X方向节点数（必需）
+- `-ny <数值>`: Y方向节点数（必需）
+- `-nz <数值>`: Z方向节点数（必需）
+- `-maxItr <数值>`: 最大迭代次数（默认200）
+- `-output_final_vtk`: 输出最终VTK文件
+
+### 示例
+
+```bash
+# 双GPU，200次迭代，输出VTK
+mpirun -np 2 ./src/topopt -nx 65 -ny 33 -nz 33 -maxItr 200 -output_final_vtk
+```
+
+## VTK可视化
+
+生成VTK文件后，使用Python脚本转换为ParaView格式：
+
+```bash
+cd src
+python3 bin2vtu_v3.py 0
+```
+
+生成的`.vtu`文件可以用ParaView打开查看。
+
+## 输出说明
+
+程序每10次迭代输出一次，包含以下信息：
+
+- **It.**: 迭代次数
+- **真实fx**: 真实目标函数值
+- **缩放fx**: 缩放后的目标函数值
+- **gx[0]**: 体积约束值
+- **ch.**: 设计变化（收敛指标）
+- **mnd.**: 离散度量
+- **KSP**: 本次KSP迭代次数
+- **总KSP**: 累计KSP迭代次数
+- **time**: 本次迭代时间（秒）
 
 ## 配置文件
 
-- **options_gpu_balanced.txt** - 单GPU最优配置（推荐）
-- **options_dual_gpu_production.txt** - 双GPU生产配置
-- **options_gpu.txt** - 基础GPU配置
+`configs/options_pcg_standard.txt` - PCG求解器标准配置（可选使用）
 
-## 性能对比
+## 项目结构
 
-### 小规模问题 (65×33×33, 3次迭代)
-
-| 配置 | 平均时间 | 加速比 |
-|------|---------|--------|
-| CPU | 8.02秒 | 1.0× |
-| 单GPU | 0.95秒 | 8.44× |
-| 双GPU | 1.43秒 | 5.61× |
-
-### 大规模问题 (129×65×65, 3次迭代)
-
-| 配置 | 平均时间 | 加速比 |
-|------|---------|--------|
-| 单GPU | 7.72秒 | 1.0× |
-| 双GPU | 4.48秒 | 1.72× |
-
-**结论**: 
-- 小规模问题: 单GPU最优 (通信开销大于并行收益)
-- 大规模问题: 双GPU最优 (并行收益超过通信开销)
-- 问题规模越大，双GPU优势越明显
-
-## 网格尺寸要求
-
-使用多层网格(nlvls>1)时，网格尺寸必须满足：
 ```
-(nodes-1) 能被 2^(nlvls-1) 整除
+.
+├── src/                    # 源代码
+│   ├── main.cc            # 主程序
+│   ├── TopOpt.cc/h        # 拓扑优化参数
+│   ├── LinearElasticity.cc/h  # 线性弹性求解器
+│   ├── OC.cc/h            # OC优化器
+│   ├── Filter.cc/h        # 滤波器基类
+│   ├── PDEFilter.cc/h     # PDE滤波器
+│   ├── MPIIO.cc/h         # VTK输出
+│   ├── MatrixFreeGPU.cu/h # GPU Matrix-Free实现
+│   ├── bin2vtu_v3.py      # VTK转换脚本
+│   └── makefile           # 编译配置
+├── configs/               # 配置文件
+│   └── options_pcg_standard.txt
+└── README.md             # 本文件
 ```
 
-nlvls=4时，有效节点数: 9, 17, 25, 33, 65, 129
+## 注意事项
 
-示例:
-- ✓ 65×65×33
-- ✓ 65×33×33  
-- ✗ 65×64×64 (64不满足要求)
+1. **收敛性**: 固定penal=3.0可能导致收敛困难，建议使用延拓策略
+2. **内存**: Matrix-Free模式节省内存，适合大规模问题
+3. **GPU**: 确保CUDA_VISIBLE_DEVICES正确设置
+4. **KSP迭代**: 如果KSP经常达到最大迭代次数，考虑增加maxiter或使用更强的预条件器
 
-## 规模限制
+## 许可证
 
-当前配置(32位PETSc索引)的最大问题规模:
-- 单GPU: 约130×130×65 (受GPU内存限制，24GB)
-- 双GPU: 约130×65×65 (受32位整数索引限制)
+本项目基于原始TopOpt_in_PETSc项目修改。
 
-更大规模需要重新编译PETSc使用64位索引 (--with-64-bit-indices)
+## 作者
 
-## 系统配置
+原始项目: Niels Aage, Erik Andreassen, Boyan Lazarov (2013-2019)
 
-- **PETSc**: 3.21.0 (arch-cuda-mpi)
-- **CUDA**: 12.2
-- **OpenMPI**: 4.1.6 (GPU-aware)
-- **GPU**: NVIDIA RTX 4090 × 2
+GPU加速和简化版本修改: 2026
 
-## 详细文档
+## 参考文献
 
-- **双GPU使用说明.txt** - 双GPU配置详细说明和性能数据
+- Aage, N., Andreassen, E., Lazarov, B. S., & Sigmund, O. (2017). Giga-voxel computational morphogenesis for structural design. Nature, 550(7674), 84-86.

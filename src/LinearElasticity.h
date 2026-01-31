@@ -67,8 +67,18 @@ class LinearElasticity {
     // Get pointer to DMDA
     DM GetDM() { return (da_nodal); };
 
+    // Get last KSP iteration count
+    PetscInt GetLastKSPIterations() { return (last_ksp_iterations); };
+    
+    // Get total KSP iteration count
+    PetscInt GetTotalKSPIterations() { return (total_ksp_iterations); };
+
     // Logical mesh
     DM da_nodal; // Nodal mesh
+    
+    // KSP统计信息
+    PetscInt last_ksp_iterations;  // 最后一次KSP求解的迭代次数
+    PetscInt total_ksp_iterations; // 累计KSP迭代次数
 
     // Matrix-Free相关（公开以便静态函数访问）
     PetscBool use_matrix_free;           // 是否使用Matrix-Free

@@ -34,11 +34,6 @@ void TopOpt::Init() { // Dummy constructor
     da_nodes = NULL;
     da_elem  = NULL;
 
-    xo1 = NULL;
-    xo2 = NULL;
-    U   = NULL;
-    L   = NULL;
-
     SetUp();
 }
 
@@ -81,20 +76,6 @@ TopOpt::~TopOpt() {
     if (gx != NULL) {
         delete[] gx;
     }
-
-    // mma restart method
-    if (xo1 != NULL) {
-        VecDestroy(&xo1);
-    }
-    if (xo2 != NULL) {
-        VecDestroy(&xo2);
-    }
-    if (L != NULL) {
-        VecDestroy(&L);
-    }
-    if (U != NULL) {
-        VecDestroy(&U);
-    }
 }
 
 // NO METHODS !
@@ -113,20 +94,19 @@ PetscErrorCode TopOpt::SetUp() {
     xc[4]   = 0.0;
     xc[5]   = 1.0;
     nu      = 0.3;
-    nlvls   = 4;
+    nlvls   = 1;  // PCG模式：不使用多重网格
 
     // SET DEFAULTS for optimization problems
     volfrac = 0.12;
-    maxItr  = 400;
+    maxItr  = 200;  // 默认200次迭代
     rmin    = -1.0;  // -1表示自动计算（1.5倍单元尺寸）
     penal   = 3.0;
     Emin    = 1.0e-9;
     Emax    = 1.0;
-    filter  = 1; // 0=sens,1=dens,2=PDE - other val == no filtering
+    filter  = 2;  // 固定使用PDE滤波器
     Xmin    = 0.0;
     Xmax    = 1.0;
     movlim  = 0.2;
-    restart = PETSC_TRUE;
 
     // Projection filter
     projectionFilter = PETSC_FALSE;
@@ -156,19 +136,12 @@ PetscErrorCode TopOpt::SetUpMESH() {
     // Read input from arguments
     PetscBool flg;
 
-    // Physics parameters
+    // 只保留网格参数（必需）
     PetscOptionsGetInt(NULL, NULL, "-nx", &(nxyz[0]), &flg);
     PetscOptionsGetInt(NULL, NULL, "-ny", &(nxyz[1]), &flg);
     PetscOptionsGetInt(NULL, NULL, "-nz", &(nxyz[2]), &flg);
-    PetscOptionsGetReal(NULL, NULL, "-xcmin", &(xc[0]), &flg);
-    PetscOptionsGetReal(NULL, NULL, "-xcmax", &(xc[1]), &flg);
-    PetscOptionsGetReal(NULL, NULL, "-ycmin", &(xc[2]), &flg);
-    PetscOptionsGetReal(NULL, NULL, "-ycmax", &(xc[3]), &flg);
-    PetscOptionsGetReal(NULL, NULL, "-zcmin", &(xc[4]), &flg);
-    PetscOptionsGetReal(NULL, NULL, "-zcmax", &(xc[5]), &flg);
-    PetscOptionsGetReal(NULL, NULL, "-penal", &penal, &flg);
-    PetscOptionsGetInt(NULL, NULL, "-nlvls", &nlvls,
-                       &flg); // NEEDS THIS TO CHECK IF MESH IS OK BEFORE PROCEEDING !!!!
+    
+    // 其他参数都使用默认值（已在Init()中设置）
 
     // Write parameters for the physics _ OWNED BY TOPOPT
     PetscPrintf(PETSC_COMM_WORLD, "##############################################"
@@ -325,37 +298,21 @@ PetscErrorCode TopOpt::SetUpOPT() {
 
     PetscBool flg;
 
-    // Optimization paramteres
-    PetscOptionsGetReal(NULL, NULL, "-Emin", &Emin, &flg);
-    PetscOptionsGetReal(NULL, NULL, "-Emax", &Emax, &flg);
-    PetscOptionsGetReal(NULL, NULL, "-nu", &nu, &flg);
-    PetscOptionsGetReal(NULL, NULL, "-volfrac", &volfrac, &flg);
-    PetscOptionsGetReal(NULL, NULL, "-penal", &penal, &flg);
-    PetscOptionsGetReal(NULL, NULL, "-rmin", &rmin, &flg);
+    // 只保留最大迭代次数参数（可选，默认200）
     PetscOptionsGetInt(NULL, NULL, "-maxItr", &maxItr, &flg);
-    PetscOptionsGetInt(NULL, NULL, "-filter", &filter, &flg);
-    PetscOptionsGetReal(NULL, NULL, "-Xmin", &Xmin, &flg);
-    PetscOptionsGetReal(NULL, NULL, "-Xmax", &Xmax, &flg);
-    PetscOptionsGetReal(NULL, NULL, "-movlim", &movlim, &flg);
-    PetscOptionsGetBool(NULL, NULL, "-projectionFilter", &projectionFilter, &flg);
-    PetscOptionsGetReal(NULL, NULL, "-beta", &beta, &flg);
-    PetscOptionsGetReal(NULL, NULL, "-betaFinal", &betaFinal, &flg);
-    PetscOptionsGetReal(NULL, NULL, "-eta", &eta, &flg);
+    
+    // 其他所有参数都使用默认值（已在Init()中设置）
 
     PetscPrintf(PETSC_COMM_WORLD, "################### Optimization settings ####################\n");
     PetscPrintf(PETSC_COMM_WORLD, "# Problem size: n= %i, m= %i\n", n, m);
-    PetscPrintf(PETSC_COMM_WORLD, "# -filter: %i  (0=sens., 1=dens, 2=PDE)\n", filter);
-    PetscPrintf(PETSC_COMM_WORLD, "# -rmin: %f (%.1f elements)\n", rmin, rmin / dx);
-    PetscPrintf(PETSC_COMM_WORLD, "# -projectionFilter: %i  (0/1)\n", projectionFilter);
-    PetscPrintf(PETSC_COMM_WORLD, "# -beta: %f\n", beta);
-    PetscPrintf(PETSC_COMM_WORLD, "# -betaFinal: %f\n", betaFinal);
-    PetscPrintf(PETSC_COMM_WORLD, "# -eta: %f\n", eta);
-    PetscPrintf(PETSC_COMM_WORLD, "# -volfrac: %f\n", volfrac);
-    PetscPrintf(PETSC_COMM_WORLD, "# -penal: %f\n", penal);
-    PetscPrintf(PETSC_COMM_WORLD, "# -Emin/-Emax: %e - %e \n", Emin, Emax);
-    PetscPrintf(PETSC_COMM_WORLD, "# -nu: %f \n", nu);
-    PetscPrintf(PETSC_COMM_WORLD, "# -maxItr: %i\n", maxItr);
-    PetscPrintf(PETSC_COMM_WORLD, "# -movlim: %f\n", movlim);
+    PetscPrintf(PETSC_COMM_WORLD, "# Filter: PDE (rmin: %f, %.1f elements)\n", rmin, rmin / dx);
+    PetscPrintf(PETSC_COMM_WORLD, "# Volume fraction: %f\n", volfrac);
+    PetscPrintf(PETSC_COMM_WORLD, "# Penalty factor: %f (fixed)\n", penal);
+    PetscPrintf(PETSC_COMM_WORLD, "# Emin/Emax: %e / %e\n", Emin, Emax);
+    PetscPrintf(PETSC_COMM_WORLD, "# Poisson's ratio: %f\n", nu);
+    PetscPrintf(PETSC_COMM_WORLD, "# Max iterations: %i\n", maxItr);
+    PetscPrintf(PETSC_COMM_WORLD, "# Move limit: %f\n", movlim);
+    PetscPrintf(PETSC_COMM_WORLD, "# Convergence criterion: ch < 0.02\n");
     PetscPrintf(PETSC_COMM_WORLD, "##############################################################\n");
 
     // Allocate after input
@@ -387,190 +344,4 @@ PetscErrorCode TopOpt::SetUpOPT() {
     VecSet(xold, volfrac);
 
     return (ierr);
-}
-
-PetscErrorCode TopOpt::AllocateMMAwithRestart(PetscInt* itr, MMA** mma) {
-
-    PetscErrorCode ierr = 0;
-
-    // Set MMA parameters (for multiple load cases)
-    PetscScalar aMMA[m];
-    PetscScalar cMMA[m];
-    PetscScalar dMMA[m];
-    for (PetscInt i = 0; i < m; i++) {
-        aMMA[i] = 0.0;
-        dMMA[i] = 0.0;
-        cMMA[i] = 1000.0;
-    }
-
-    // Check if restart is desired
-    restart                  = PETSC_TRUE;  // DEFAULT USES RESTART
-    flip                     = PETSC_TRUE;  // BOOL to ensure that two dump streams are kept
-    PetscBool onlyLoadDesign = PETSC_FALSE; // Default restarts everything
-
-    // Get inputs
-    PetscBool flg;
-    char      filenameChar[PETSC_MAX_PATH_LEN];
-    PetscOptionsGetBool(NULL, NULL, "-restart", &restart, &flg);
-    PetscOptionsGetBool(NULL, NULL, "-onlyLoadDesign", &onlyLoadDesign, &flg);
-
-    if (restart) {
-        ierr = VecDuplicate(x, &xo1);
-        CHKERRQ(ierr);
-        ierr = VecDuplicate(x, &xo2);
-        CHKERRQ(ierr);
-        ierr = VecDuplicate(x, &U);
-        CHKERRQ(ierr);
-        ierr = VecDuplicate(x, &L);
-        CHKERRQ(ierr);
-    }
-
-    // Determine the right place to write the new restart files
-    std::string filenameWorkdir = "./";
-    PetscOptionsGetString(NULL, NULL, "-workdir", filenameChar, sizeof(filenameChar), &flg);
-    if (flg) {
-        filenameWorkdir = "";
-        filenameWorkdir.append(filenameChar);
-    }
-    filename00    = filenameWorkdir;
-    filename00Itr = filenameWorkdir;
-    filename01    = filenameWorkdir;
-    filename01Itr = filenameWorkdir;
-
-    filename00.append("/Restart00.dat");
-    filename00Itr.append("/Restart00_itr_f0.dat");
-    filename01.append("/Restart01.dat");
-    filename01Itr.append("/Restart01_itr_f0.dat");
-
-    // Where to read the restart point from
-    std::string restartFileVec = ""; // NO RESTART FILE !!!!!
-    std::string restartFileItr = ""; // NO RESTART FILE !!!!!
-
-    PetscOptionsGetString(NULL, NULL, "-restartFileVec", filenameChar, sizeof(filenameChar), &flg);
-    if (flg) {
-        restartFileVec.append(filenameChar);
-    }
-    PetscOptionsGetString(NULL, NULL, "-restartFileItr", filenameChar, sizeof(filenameChar), &flg);
-    if (flg) {
-        restartFileItr.append(filenameChar);
-    }
-
-    // Which solution to use for restarting
-    PetscPrintf(PETSC_COMM_WORLD, "##############################################################\n");
-    PetscPrintf(PETSC_COMM_WORLD, "# Continue from previous iteration (-restart): %i \n", restart);
-    PetscPrintf(PETSC_COMM_WORLD, "# Restart file (-restartFileVec): %s \n", restartFileVec.c_str());
-    PetscPrintf(PETSC_COMM_WORLD, "# Restart file (-restartFileItr): %s \n", restartFileItr.c_str());
-    PetscPrintf(PETSC_COMM_WORLD,
-                "# New restart files are written to (-workdir): %s "
-                "(Restart0x.dat and Restart0x_itr_f0.dat) \n",
-                filenameWorkdir.c_str());
-
-    // Check if files exist:
-    PetscBool vecFile = fexists(restartFileVec);
-    if (!vecFile) {
-        PetscPrintf(PETSC_COMM_WORLD, "File: %s NOT FOUND \n", restartFileVec.c_str());
-    }
-    PetscBool itrFile = fexists(restartFileItr);
-    if (!itrFile) {
-        PetscPrintf(PETSC_COMM_WORLD, "File: %s NOT FOUND \n", restartFileItr.c_str());
-    }
-
-    // Read from restart point
-
-    PetscInt nGlobalDesignVar;
-    VecGetSize(x,
-               &nGlobalDesignVar); // ASSUMES THAT SIZE IS ALWAYS MATCHED TO CURRENT MESH
-    if (restart && vecFile && itrFile) {
-
-        PetscViewer view;
-        // Open the data files
-        ierr = PetscViewerBinaryOpen(PETSC_COMM_WORLD, restartFileVec.c_str(), FILE_MODE_READ, &view);
-
-        VecLoad(x, view);
-        VecLoad(xPhys, view);
-        VecLoad(xo1, view);
-        VecLoad(xo2, view);
-        VecLoad(U, view);
-        VecLoad(L, view);
-        PetscViewerDestroy(&view);
-
-        // Read iteration and fscale
-        std::fstream itrfile(restartFileItr.c_str(), std::ios_base::in);
-        itrfile >> itr[0];
-        itrfile >> fscale;
-
-        // Choose if restart is full or just an initial design guess
-        if (onlyLoadDesign) {
-            PetscPrintf(PETSC_COMM_WORLD, "# Loading design from file: %s \n", restartFileVec.c_str());
-            *mma = new MMA(nGlobalDesignVar, m, x, aMMA, cMMA, dMMA);
-        } else {
-            PetscPrintf(PETSC_COMM_WORLD, "# Continue optimization from file: %s \n", restartFileVec.c_str());
-            *mma = new MMA(nGlobalDesignVar, m, *itr, xo1, xo2, U, L, aMMA, cMMA, dMMA);
-        }
-
-        PetscPrintf(PETSC_COMM_WORLD, "# Successful restart from file: %s and %s \n", restartFileVec.c_str(),
-                    restartFileItr.c_str());
-    } else {
-        *mma = new MMA(nGlobalDesignVar, m, x, aMMA, cMMA, dMMA);
-    }
-
-    return ierr;
-}
-
-PetscErrorCode TopOpt::WriteRestartFiles(PetscInt* itr, MMA* mma) {
-
-    PetscErrorCode ierr = 0;
-    // Only dump data if correct allocater has been used
-    if (!restart) {
-        return -1;
-    }
-
-    // Get restart vectors
-    mma->Restart(xo1, xo2, U, L);
-
-    // Choose previous set of restart files
-    if (flip) {
-        flip = PETSC_FALSE;
-    } else {
-        flip = PETSC_TRUE;
-    }
-
-    // Write file with iteration number of f0 scaling
-    // and a file with the MMA-required vectors, in the following order:
-    // : x,xPhys,xold1,xold2,U,L
-    PetscViewer view;         // vectors
-    PetscViewer restartItrF0; // scalars
-
-    PetscViewerCreate(PETSC_COMM_WORLD, &restartItrF0);
-    PetscViewerSetType(restartItrF0, PETSCVIEWERASCII);
-    PetscViewerFileSetMode(restartItrF0, FILE_MODE_WRITE);
-
-    // Open viewers for writing
-    if (!flip) {
-        PetscViewerBinaryOpen(PETSC_COMM_WORLD, filename00.c_str(), FILE_MODE_WRITE, &view);
-        PetscViewerFileSetName(restartItrF0, filename00Itr.c_str());
-    } else if (flip) {
-        PetscViewerBinaryOpen(PETSC_COMM_WORLD, filename01.c_str(), FILE_MODE_WRITE, &view);
-        PetscViewerFileSetName(restartItrF0, filename01Itr.c_str());
-    }
-
-    // Write iteration and fscale
-    PetscViewerASCIIPrintf(restartItrF0, "%d ", itr[0]);
-    PetscViewerASCIIPrintf(restartItrF0, " %e", fscale);
-    PetscViewerASCIIPrintf(restartItrF0, "\n");
-
-    // Write vectors
-    VecView(x, view); // the design variables
-    VecView(xPhys, view);
-    VecView(xo1, view);
-    VecView(xo2, view);
-    VecView(U, view);
-    VecView(L, view);
-
-    // Clean up
-    PetscViewerDestroy(&view);
-    PetscViewerDestroy(&restartItrF0);
-
-    // PetscPrintf(PETSC_COMM_WORLD,"DONE WRITING DATA\n");
-    return ierr;
 }

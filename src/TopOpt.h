@@ -3,7 +3,6 @@
 
 #include <petsc.h>
 //#include <petsc-private/dmdaimpl.h>
-#include "MMA.h"
 #include <fstream>
 #include <iostream>
 #include <math.h>
@@ -40,10 +39,6 @@ class TopOpt {
     TopOpt(PetscInt nconstraint);
     TopOpt();
     ~TopOpt();
-
-    // Method to allocate MMA with/without restarting
-    PetscErrorCode AllocateMMAwithRestart(PetscInt* itr, MMA** mma);
-    PetscErrorCode WriteRestartFiles(PetscInt* itr, MMA* mma);
 
     // Physical domain variables
     PetscScalar xc[6];      // Domain coordinates
@@ -91,11 +86,6 @@ class TopOpt {
     Vec  xold;       // x from previous iteration
     Vec* dgdx;       // Sensitivities of constraints (vector array)
 
-    // Restart data for MMA:
-    PetscBool   restart, flip;
-    std::string restdens_1, restdens_2;
-    Vec         xo1, xo2, U, L;
-
   private:
     // Allocate and set default values
     void           Init();
@@ -103,9 +93,6 @@ class TopOpt {
 
     PetscErrorCode SetUpMESH();
     PetscErrorCode SetUpOPT();
-
-    // Restart filenames
-    std::string filename00, filename00Itr, filename01, filename01Itr;
 
     // File existence
     inline PetscBool fexists(const std::string& filename) {

@@ -29,7 +29,7 @@ PDEFilt::PDEFilt(DM da_nodes, PetscScalar rmin) {
 
     R = rmin / 2.0 / sqrt(3); // conversion factor for the PDEfilter
 
-    nlvls = 3; // MG levels
+    nlvls = 1; // PCG模式：不使用多重网格
 
     // number of nodal dofs
     PetscInt numnodaldof = 1;
@@ -208,7 +208,7 @@ PetscErrorCode PDEFilt::FilterProject(Vec OX, Vec FX) {
     CHKERRQ(ierr);
 
     t2 = MPI_Wtime();
-    PetscPrintf(PETSC_COMM_WORLD, "PDEFilter solver:  iter: %i, rerr.: %e, time: %f\n", niter, rnorm, t2 - t1);
+    // PetscPrintf(PETSC_COMM_WORLD, "PDEFilter solver:  iter: %i, rerr.: %e, time: %f\n", niter, rnorm, t2 - t1);
     return ierr;
 }
 
@@ -284,7 +284,12 @@ PetscErrorCode PDEFilt::SetUpSolver() {
 
     // preconditioner
     KSPGetPC(ksp, &pc);
-    PCSetType(pc, PCMG);
+    // PCG模式：使用Jacobi预条件器
+    if (nlvls == 1) {
+        PCSetType(pc, PCJACOBI);
+    } else {
+        PCSetType(pc, PCMG);
+    }
     // Set solver from options
     KSPSetFromOptions(ksp);
     // Get the prec again - check if it has changed
@@ -295,7 +300,7 @@ PetscErrorCode PDEFilt::SetUpSolver() {
     PetscBool pcmg_flag = PETSC_TRUE;
     PetscObjectTypeCompare((PetscObject)pc, PCMG, &pcmg_flag);
     // Only if PCMG is used
-    if (pcmg_flag) {
+    if (pcmg_flag && nlvls > 1) {
         // DMs for grid hierachy
         DM *da_list, *daclist;
         Mat R;

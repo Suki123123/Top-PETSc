@@ -61,10 +61,26 @@ static PetscErrorCode MatMult_MatrixFree(Mat A, Vec x, Vec y) {
     PetscBool use_gpu = PETSC_FALSE;
     VecType vec_type;
     VecGetType(xloc, &vec_type);
+
+    // DEBUG: 打印向量类型（只在第一次调用时打印）
+    static int debug_count = 0;
+    if (debug_count == 0) {
+        PetscPrintf(PETSC_COMM_WORLD, "# DEBUG: xloc vec_type = %s, gpu_res = %p\n",
+                    vec_type ? vec_type : "NULL", (void*)ctx->gpu_res);
+        debug_count++;
+    }
+
     if (vec_type && ctx->gpu_res &&
         (strcmp(vec_type, VECCUDA) == 0 || strcmp(vec_type, VECMPICUDA) == 0 ||
          strcmp(vec_type, VECSEQCUDA) == 0)) {
         use_gpu = PETSC_TRUE;
+    }
+
+    // DEBUG: 打印是否使用GPU（只在第一次调用时打印）
+    static int debug_count2 = 0;
+    if (debug_count2 == 0) {
+        PetscPrintf(PETSC_COMM_WORLD, "# DEBUG: use_gpu = %s\n", use_gpu ? "TRUE" : "FALSE");
+        debug_count2++;
     }
 
     if (use_gpu) {
@@ -328,10 +344,14 @@ LinearElasticity::LinearElasticity(DM da_nodes) {
     use_matrix_free = PETSC_TRUE;
     mf_ctx = NULL;
     mf_ctx_levels = NULL;
+    
+    // KSP统计信息初始化
+    last_ksp_iterations = 0;
+    total_ksp_iterations = 0;
 
     // Parameters - to be changed on read of variables
     nu    = 0.3;
-    nlvls = 4;
+    nlvls = 1;  // PCG模式：不使用多重网格
     PetscBool flg;
     PetscOptionsGetInt(NULL, NULL, "-nlvls", &nlvls, &flg);
     PetscOptionsGetReal(NULL, NULL, "-nu", &nu, &flg);
@@ -621,9 +641,13 @@ PetscErrorCode LinearElasticity::SolveState(Vec xPhys, PetscScalar Emin, PetscSc
     ierr = VecNorm(RHS, NORM_2, &RHSnorm);
     CHKERRQ(ierr);
     rnorm = rnorm / RHSnorm;
+    
+    // 保存KSP迭代次数
+    last_ksp_iterations = niter;
+    total_ksp_iterations += niter;  // 累加到总次数
 
     t2 = MPI_Wtime();
-    PetscPrintf(PETSC_COMM_WORLD, "State solver:  iter: %i, rerr.: %e, time: %f\n", niter, rnorm, t2 - t1);
+    // PetscPrintf(PETSC_COMM_WORLD, "State solver:  iter: %i, rerr.: %e, time: %f\n", niter, rnorm, t2 - t1);
 
     return ierr;
 }
@@ -1077,8 +1101,13 @@ PetscErrorCode LinearElasticity::SetUpSolver() {
 
     // The preconditinoer
     KSPGetPC(ksp, &pc);
-    // Make PCMG the default solver
-    PCSetType(pc, PCMG);
+    // PCG模式（nlvls=1）：使用Jacobi预条件器
+    // 多重网格模式（nlvls>1）：使用PCMG
+    if (nlvls == 1) {
+        PCSetType(pc, PCJACOBI);
+    } else {
+        PCSetType(pc, PCMG);
+    }
 
     // Set solver from options
     KSPSetFromOptions(ksp);
@@ -1091,7 +1120,7 @@ PetscErrorCode LinearElasticity::SetUpSolver() {
     PetscObjectTypeCompare((PetscObject)pc, PCMG, &pcmg_flag);
 
     // Only if PCMG is used
-    if (pcmg_flag) {
+    if (pcmg_flag && nlvls > 1) {
 
         // DMs for grid hierachy
         DM *da_list, *daclist;
